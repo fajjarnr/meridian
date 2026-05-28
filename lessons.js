@@ -405,12 +405,12 @@ export function evolveThresholds(perfData, config) {
     }
   }
 
-  // ── 2. minFeeTvlRatio ─────────────────────────────────────────
+  // ── 2. minFeeActiveTvlRatio ───────────────────────────────────
   // Raise the floor if low-fee pools consistently underperform.
   {
     const winnerFees = winners.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
     const loserFees  = losers.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
-    const current    = config.screening.minFeeTvlRatio;
+    const current    = config.screening.minFeeActiveTvlRatio;
 
     if (winnerFees.length >= 2) {
       // Minimum fee/TVL among winners — we know pools below this don't work for us
@@ -420,8 +420,8 @@ export function evolveThresholds(perfData, config) {
         const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
         const rounded = Number(newVal.toFixed(2));
         if (rounded > current) {
-          changes.minFeeTvlRatio = rounded;
-          rationale.minFeeTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
+          changes.minFeeActiveTvlRatio = rounded;
+          rationale.minFeeActiveTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
         }
       }
     }
@@ -436,9 +436,9 @@ export function evolveThresholds(perfData, config) {
           const target  = maxLoserFee * 1.2;
           const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
           const rounded = Number(newVal.toFixed(2));
-          if (rounded > current && !changes.minFeeTvlRatio) {
-            changes.minFeeTvlRatio = rounded;
-            rationale.minFeeTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
+          if (rounded > current && !changes.minFeeActiveTvlRatio) {
+            changes.minFeeActiveTvlRatio = rounded;
+            rationale.minFeeActiveTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
           }
         }
       }
@@ -478,9 +478,8 @@ export function evolveThresholds(perfData, config) {
     // Frequency: how many positions affected? (max 30)
     score += Math.min(perfData.length * 2, 30);
     // Failure reduction: will this prevent losses? (max 30)
-    // Note: maxVolatility is a known no-op key (see CLAUDE.md tech debt).
     // Only give bonus to keys that actually map to working config fields.
-    score += key === "minFeeTvlRatio" || key === "minOrganic" ? 25 : 15;
+    score += key === "minFeeActiveTvlRatio" || key === "maxVolatility" || key === "minOrganic" ? 25 : 15;
     // Safety margin: conservative change? (max 20)
     if (oldVal != null) {
       const deltaPct = Math.abs((newVal - oldVal) / oldVal) * 100;
@@ -514,9 +513,9 @@ export function evolveThresholds(perfData, config) {
 
   // Apply to live config object immediately
   const s = config.screening;
-  if (changes.maxVolatility    != null) s.maxVolatility    = changes.maxVolatility;
-  if (changes.minFeeTvlRatio   != null) s.minFeeTvlRatio   = changes.minFeeTvlRatio;
-  if (changes.minOrganic       != null) s.minOrganic       = changes.minOrganic;
+  if (changes.maxVolatility        != null) s.maxVolatility        = changes.maxVolatility;
+  if (changes.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = changes.minFeeActiveTvlRatio;
+  if (changes.minOrganic           != null) s.minOrganic           = changes.minOrganic;
 
   // Log a lesson summarizing the evolution
   const data = load();
@@ -726,7 +725,7 @@ export function detectRecurringPatterns(opts = {}) {
   // Fee collapse recurring: 3+ closes with fee_collapse
   if ((signalFreq["fee_collapse"] || 0) >= 3) {
     insights.push(
-      `[PATTERN: fee_collapse x${signalFreq["fee_collapse"]}] Pools are consistently earning < 0.5% fees. Screening minFeeTvlRatio may be too low — raise it, or the market is too slow for LP right now.`
+      `[PATTERN: fee_collapse x${signalFreq["fee_collapse"]}] Pools are consistently earning < 0.5% fees. Screening minFeeActiveTvlRatio may be too low — raise it, or the market is too slow for LP right now.`
     );
   }
 
@@ -754,7 +753,7 @@ export function detectRecurringPatterns(opts = {}) {
   // Stop loss streak: 3+ stop losses in window
   if ((signalFreq["stop_loss_hit"] || 0) >= 3) {
     insights.push(
-      `[PATTERN: stop_loss_hit x${signalFreq["stop_loss_hit"]}] Consecutive stop losses triggered. Screening is not filtering well — tighten ALL thresholds (minFeeTvlRatio, minOrganic, maxVolatility) until the streak breaks.`
+      `[PATTERN: stop_loss_hit x${signalFreq["stop_loss_hit"]}] Consecutive stop losses triggered. Screening is not filtering well — tighten ALL thresholds (minFeeActiveTvlRatio, minOrganic, maxVolatility) until the streak breaks.`
     );
   }
 

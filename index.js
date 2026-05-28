@@ -1410,7 +1410,7 @@ async function deployLatestCandidate(index) {
     }
   }
   const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
-  const binsBelow = computeBinsBelow(candidate.volatility);
+  const binsBelow = computeBinsBelow(candidate.volatility, candidate.bin_step, candidate.mcap);
   const result = await executeTool("deploy_position", {
     pool_address: candidate.pool,
     amount_y: deployAmount,
@@ -1769,14 +1769,36 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   return null;
 }
 
-function computeBinsBelow(volatility) {
-  const parsedVolatility = Number(volatility);
-  if (!Number.isFinite(parsedVolatility) || parsedVolatility <= 0) {
-    throw new Error(`Invalid volatility ${volatility ?? "unknown"} — refusing volatility-scaled deploy.`);
+function computeBinsBelow(volatility, binStep = 100, marketCap = 0) {
+  const binStepPct = binStep / 100;
+  if (binStepPct <= 0) return 35;
+
+  let targetDropPct = 35; // Fallback floor
+
+  if (config.strategy.downsideMode === "static") {
+    targetDropPct = config.strategy.downsidePct ?? 90;
+  } else if (config.strategy.downsideMode === "volatility") {
+    // Linear scale between 35% and 90% based on volatility 0-5+
+    const parsedVol = Math.max(0, Number(volatility || 0));
+    targetDropPct = 35 + Math.min(55, (parsedVol / 5) * 55);
+  } else {
+    // "graduated" mode (Default Option C)
+    const mc = Number(marketCap || 0);
+    if (mc < 1_000_000) {
+      targetDropPct = 90; // Tier 1: Microcap -> Full venufitratama14 safety
+    } else if (mc < 5_000_000) {
+      targetDropPct = 60; // Tier 2: Mid-cap -> Optimized safety/yield balance
+    } else {
+      targetDropPct = 35; // Tier 3: Established -> Max yield density
+    }
   }
-  const lo = config.strategy.minBinsBelow;
-  const hi = config.strategy.maxBinsBelow;
-  return Math.max(lo, Math.min(hi, Math.round(lo + (parsedVolatility / 5) * (hi - lo))));
+
+  const calculatedBins = Math.round(targetDropPct / binStepPct);
+
+  // Still apply global min/max clamps for safety
+  const minBins = Math.max(35, config.strategy.minBinsBelow ?? 35);
+  const maxBins = config.strategy.maxBinsBelow ?? 120;
+  return Math.max(minBins, Math.min(maxBins, calculatedBins));
 }
 
 // Register restarter — when update_config changes intervals, running cron jobs get replaced

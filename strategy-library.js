@@ -89,6 +89,17 @@ const DEFAULT_STRATEGIES = {
     exit: { take_profit_pct: 10, notes: "When total return >= 10% of deployed capital: withdraw_liquidity(bps=5000) to take 50% off. Remaining 50% keeps running. Repeat at next threshold." },
     best_for: "Locking in profits without fully exiting winning positions",
   },
+  exit_liquidity_spot: {
+    id: "exit_liquidity_spot",
+    name: "Exit Liquidity Spot (venufitratama14)",
+    author: "venufitratama14",
+    lp_strategy: "spot",
+    token_criteria: { notes: "High volatility, high reward memecoins." },
+    entry: { condition: "Always SOL-sided only, amount_x=0, bins_above=0", single_side: "SOL" },
+    range: { type: "custom", downside_mode: "graduated", notes: "Automatically targets -90% drop for microcaps, scaling down to -35% drop for large caps." },
+    exit: { notes: "Normal management rules, OOR rebalance if pool remains lucrative." },
+    best_for: "Capturing massive panic exit fees during memecoin dumps without getting wiped out.",
+  },
 };
 
 function ensureDefaultStrategies() {

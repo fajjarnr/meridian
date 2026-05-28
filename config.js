@@ -145,6 +145,8 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    downsideMode: u.downsideMode ?? "graduated", // "graduated" | "static" | "volatility"
+    downsidePct:  u.downsidePct  ?? 90,          // target drop percentage for static mode
     spotMinVolume24h: u.spotMinVolume24h ?? 50000,  // allow spot strategy above this 24h volume
     // Multi-technique range analysis (ATR, BB, VWAP, Volume Profile, Fibonacci, Pivot Points)
     rangeAnalysis: {
@@ -294,6 +296,8 @@ export function reloadScreeningThresholds() {
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
     if (fresh.allowedLaunchpads !== undefined) s.allowedLaunchpads = fresh.allowedLaunchpads;
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
+    if (fresh.downsideMode !== undefined) config.strategy.downsideMode = fresh.downsideMode;
+    if (fresh.downsidePct !== undefined) config.strategy.downsidePct = fresh.downsidePct != null ? (numericConfig(fresh.downsidePct) ?? 90) : null;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

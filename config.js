@@ -71,11 +71,18 @@ export const config = {
     minHolders:        u.minHolders        ?? 500,
     minMcap:           u.minMcap           ?? 150_000,
     maxMcap:           u.maxMcap           ?? 10_000_000,
-    minBinStep:        u.minBinStep        ?? 80,
-    maxBinStep:        u.maxBinStep        ?? 125,
+    minBinStep:        u.minBinStep        ?? 80,  // absolute floor (for tokens below smallest tier)
+    maxBinStep:        u.maxBinStep        ?? 200, // absolute ceiling
+    // Dynamic bin_step ranges based on token market cap (Meteora EDU 101)
+    binStepTiers:      u.binStepTiers      ?? [
+      { maxMc: 1_000_000, minBinStep: 80,  maxBinStep: 200 },  // memecoin < $1M: wide bins
+      { maxMc: 5_000_000, minBinStep: 50,  maxBinStep: 125 },  // $1M–5M: tighter
+      { maxMc: Infinity,  minBinStep: 20,  maxBinStep: 80  },  // $5M+: established
+    ],
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
+    minVolume1h:       u.minVolume1h       ?? 30000, // min 1h volume in USD (EvilPanda signal)
     useDiscordSignals: u.useDiscordSignals ?? false,
     discordSignalMode: u.discordSignalMode ?? "merge", // merge | only
     avoidPvpSymbols:   u.avoidPvpSymbols   ?? true, // avoid exact-symbol rivals with real active pools
@@ -83,10 +90,15 @@ export const config = {
     maxBundlePct:      u.maxBundlePct      ?? 30,  // max bundle holding % (OKX advanced-info)
     maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
     maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
+    maxTvlMcRatio:     u.maxTvlMcRatio     ?? 0.2, // max TVL/MC ratio — above = OOR risk (MeteoraIDN)
+    tvlmcVolumeException5m: u.tvlmcVolumeException5m ?? 500_000, // volume 5m exception — allow high TVL/MC if volume insane
+    minFeesToMcRatio:  u.minFeesToMcRatio  ?? 0.001, // min total fees/MC — below = bundled/sus (MeteoraIDN)
+    maxZeroSolHolderPct: u.maxZeroSolHolderPct ?? 50,   // max % of top holders with 0 SOL (EvilPanda)
     allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
+    dexScreenerQueries: u.dexScreenerQueries ?? ["meme", "ai", "chat", "dog", "cat", "pepe", "trump", "sol", "based"],
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
   },
 
@@ -117,6 +129,12 @@ export const config = {
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
+    // Tiered time-stop (close red positions based on severity × time)
+    timeStopDeepLossPct:     u.timeStopDeepLossPct     ?? -15,  // PnL threshold: deep loss
+    timeStopDeepLossMin:     u.timeStopDeepLossMin     ?? 60,   // close after N minutes below -15%
+    timeStopMediumLossPct:   u.timeStopMediumLossPct   ?? -5,   // PnL threshold: medium loss
+    timeStopMediumLossMin:   u.timeStopMediumLossMin   ?? 180,  // close after N minutes below -5%
+    timeStopShallowLossMin:  u.timeStopShallowLossMin  ?? 360,  // close after N minutes below 0% (but above -5%)
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
   },
@@ -127,6 +145,17 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    spotMinVolume24h: u.spotMinVolume24h ?? 50000,  // allow spot strategy above this 24h volume
+    // Multi-technique range analysis (ATR, BB, VWAP, Volume Profile, Fibonacci, Pivot Points)
+    rangeAnalysis: {
+      atrMultiplier:     u.rangeAnalysis?.atrMultiplier     ?? 2.0,   // ATR × multiplier = range width
+      bbStdDev:          u.rangeAnalysis?.bbStdDev          ?? 2.0,   // Bollinger Bands standard deviations
+      vwapStdDev:        u.rangeAnalysis?.vwapStdDev        ?? 2.0,   // VWAP band standard deviations
+      volumeProfileBins: u.rangeAnalysis?.volumeProfileBins ?? 50,    // price buckets for volume profile
+      enabledTechniques: u.rangeAnalysis?.enabledTechniques ?? [
+        "fibonacci", "atr", "bollinger", "volume_profile", "vwap", "pivot_points",
+      ],
+    },
   },
 
   // ─── Scheduling ─────────────────────────

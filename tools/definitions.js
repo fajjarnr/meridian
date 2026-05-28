@@ -140,7 +140,7 @@ HARD RULES:
   use bins_below only, keep bins_above=0, and the upper bin will be pinned to the current active bin.
 
 Guidelines (only when user hasn't specified):
-- Strategy: use the active strategy's lp_strategy field (bid_ask or spot)
+- Strategy: ALWAYS use "bid_ask" for ALL deploys. NEVER use "spot". bid_ask provides two-sided liquidity — better upside AND downside fee capture for volatile memecoins.
 - Bins: choose from configured minBinsBelow/maxBinsBelow by positive volatility. The hard lower floor is 35 bins.
 - Deposit: single-sided SOL only: set amount_y/amount_sol, keep amount_x=0.
 
@@ -508,7 +508,37 @@ If no smart wallets are present, rely on fundamentals (fees, volume, organic sco
       }
     }
   },
+  {
+    type: "function",
+    function: {
+      name: "analyze_range",
+      description: `Run multi-technique range analysis for DLMM bin sizing.
+Combines 6 techniques and returns a consensus-based bins_below recommendation:
+  1. Fibonacci Retracement — support/resistance from 24h swing high/low (golden pocket at 61.8%)
+  2. ATR (Average True Range) — volatility-adaptive range from hourly price changes
+  3. Bollinger Bands — statistical deviation boundary (2σ below mean)
+  4. Volume Profile — POC (Point of Control) and Value Area Low from volume distribution
+  5. VWAP Bands — volume-weighted average price ± 2σ as support
+  6. Pivot Points — classic S1/S2 from daily OHLC
 
+Returns:
+- Individual technique results with bins_below + confidence (0-100)
+- Consensus: weighted average bins_below, agreement level (strong/moderate/weak), overall confidence
+- backward-compatible fibonacci.recommended.binsBelow field
+
+Use this AFTER selecting a candidate pool and BEFORE deploy_position.
+The deploy safety check will REJECT bins_below that exceed the consensus by >20%.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: { type: "string", description: "Pool/pair address (from get_top_candidates)" },
+          bin_step: { type: "number", description: "Pool's bin step (e.g., 100 for 1%, 80 for 0.8%). Default: 100" },
+          base_mint: { type: "string", description: "Base token mint address — enables chart-indicators API for more accurate Bollinger Bands" },
+        },
+        required: ["pool_address"],
+      },
+    },
+  },
   {
     type: "function",
     function: {

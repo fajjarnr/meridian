@@ -208,12 +208,60 @@ export async function recordPerformance(perf) {
 /**
  * Derive a lesson from a closed position's performance.
  * Only generates a lesson if the outcome was clearly good or bad.
+ * Tags signals for pattern aggregation (inspired by Capability Evolver's signal detection).
  */
 function derivLesson(perf) {
   const tags = [];
   const feeYieldPct = perf.initial_value_usd > 0
     ? ((perf.fees_earned_usd || 0) / perf.initial_value_usd) * 100
     : 0;
+
+  // ── Signal Detection (Evolver-style) ─────────────────────
+  const reasonLower = String(perf.close_reason || "").toLowerCase();
+
+  // Fee collapse: earned < 0.5% fees of position value
+  if (feeYieldPct < 0.5 && perf.minutes_held > 30) {
+    tags.push("fee_collapse");
+  }
+  // Fee strong: earned > 3% fees — good signal
+  if (feeYieldPct >= 3) {
+    tags.push("fee_strong");
+  }
+
+  // Volume death: close reason mentions volume
+  if (reasonLower.includes("volume")) {
+    tags.push("volume_death");
+  }
+
+  // OOR timeout
+  if (reasonLower.includes("out of range") || reasonLower.includes("oor")) {
+    tags.push("oor_timeout");
+  }
+
+  // Quick loss: closed within 30 min with negative PnL
+  if (perf.minutes_held < 30 && perf.pnl_pct < 0) {
+    tags.push("quick_loss");
+  }
+
+  // Quick win: closed within 2h with positive PnL
+  if (perf.minutes_held < 120 && perf.pnl_pct > 0) {
+    tags.push("quick_win");
+  }
+
+  // High OOR: < 30% range efficiency
+  if (perf.range_efficiency < 30) {
+    tags.push("high_oor");
+  }
+
+  // Efficient: > 80% range efficiency
+  if (perf.range_efficiency > 80) {
+    tags.push("efficient_range");
+  }
+
+  // Stop loss hit
+  if (reasonLower.includes("stop loss")) {
+    tags.push("stop_loss_hit");
+  }
 
   // Categorize outcome
   const outcome = perf.pnl_pct >= 5 ? "good"
@@ -421,6 +469,35 @@ export function evolveThresholds(perfData, config) {
     }
   }
 
+  // ── VFM Gate (Proactive Agent guardrail) ───────────────────
+  // Score each proposed change before applying.
+  // Threshold < 50 → skip. Stability > Novelty.
+  for (const [key, newVal] of Object.entries(changes)) {
+    const oldVal = config.screening[key] ?? null;
+    let score = 0;
+    // Frequency: how many positions affected? (max 30)
+    score += Math.min(perfData.length * 2, 30);
+    // Failure reduction: will this prevent losses? (max 30)
+    // Note: maxVolatility is a known no-op key (see CLAUDE.md tech debt).
+    // Only give bonus to keys that actually map to working config fields.
+    score += key === "minFeeTvlRatio" || key === "minOrganic" ? 25 : 15;
+    // Safety margin: conservative change? (max 20)
+    if (oldVal != null) {
+      const deltaPct = Math.abs((newVal - oldVal) / oldVal) * 100;
+      score += deltaPct < 20 ? 20 : (deltaPct < 50 ? 10 : 0);
+    }
+    // Explainability: clear rationale? (max 20)
+    score += rationale[key] ? 20 : 0;
+
+    if (score < 50) {
+      log("evolve", `VFM gate rejected ${key}: ${oldVal} → ${newVal} (score=${score}/100)`);
+      delete changes[key];
+      delete rationale[key];
+    } else {
+      log("evolve", `VFM gate passed ${key}: ${oldVal} → ${newVal} (score=${score}/100) — ${rationale[key]}`);
+    }
+  }
+
   if (Object.keys(changes).length === 0) return { changes: {}, rationale: {} };
 
   // ── Persist changes to user-config.json ───────────────────────
@@ -609,6 +686,128 @@ const ROLE_TAGS = {
   GENERAL:  [], // all lessons
 };
 
+// ─── Recurring Pattern Detection (Evolver-inspired) ────────────
+
+/**
+ * Scan recent performance records for recurring signal patterns.
+ * Returns insights to inject into the prompt — helps the agent detect
+ * systemic issues instead of treating each close as isolated.
+ *
+ * Inspired by Capability Evolver's signal aggregation: tracks frequencies,
+ * detects saturation, and forces state changes when patterns persist.
+ */
+export function detectRecurringPatterns(opts = {}) {
+  const { windowSize = 10, agentType = "GENERAL" } = opts;
+  const data = load();
+  const perf = data.performance;
+  if (perf.length < 3) return null;
+
+  const recent = perf.slice(-windowSize);
+  const insights = [];
+
+  // ── Signal frequency tracking ────────────────────────────
+  // Aggregate tags from lessons for recent closes
+  const signalFreq = {};
+  const recentLessons = data.lessons.filter((l) => {
+    if (!l.created_at || l.sourceType !== "performance") return false;
+    const cutoff = recent[0]?.recorded_at;
+    return cutoff ? l.created_at >= cutoff : true;
+  });
+
+  for (const lesson of recentLessons) {
+    if (!lesson.tags) continue;
+    for (const tag of lesson.tags) {
+      signalFreq[tag] = (signalFreq[tag] || 0) + 1;
+    }
+  }
+
+  // ── Pattern detection ─────────────────────────────────────
+
+  // Fee collapse recurring: 3+ closes with fee_collapse
+  if ((signalFreq["fee_collapse"] || 0) >= 3) {
+    insights.push(
+      `[PATTERN: fee_collapse x${signalFreq["fee_collapse"]}] Pools are consistently earning < 0.5% fees. Screening minFeeTvlRatio may be too low — raise it, or the market is too slow for LP right now.`
+    );
+  }
+
+  // Volume death recurring
+  if ((signalFreq["volume_death"] || 0) >= 3) {
+    insights.push(
+      `[PATTERN: volume_death x${signalFreq["volume_death"]}] Multiple pools died from volume collapse. Consider requiring higher minVolume in screening or shorter management intervals to catch dying pools earlier.`
+    );
+  }
+
+  // OOR timeout recurring
+  if ((signalFreq["oor_timeout"] || 0) >= 3) {
+    insights.push(
+      `[PATTERN: oor_timeout x${signalFreq["oor_timeout"]}] Positions consistently went out of range. Try wider bin_range (increase minBinsBelow) or deploy on lower-volatility pools.`
+    );
+  }
+
+  // Quick loss recurring: positions dying fast
+  if ((signalFreq["quick_loss"] || 0) >= 2) {
+    insights.push(
+      `[PATTERN: quick_loss x${signalFreq["quick_loss"]}] Positions closing with loss within 30 min — these were bad picks. Tighten screening: raise minOrganic, check narrative quality more carefully before deploy.`
+    );
+  }
+
+  // Stop loss streak: 3+ stop losses in window
+  if ((signalFreq["stop_loss_hit"] || 0) >= 3) {
+    insights.push(
+      `[PATTERN: stop_loss_hit x${signalFreq["stop_loss_hit"]}] Consecutive stop losses triggered. Screening is not filtering well — tighten ALL thresholds (minFeeTvlRatio, minOrganic, maxVolatility) until the streak breaks.`
+    );
+  }
+
+  // High OOR rate across many positions
+  if ((signalFreq["high_oor"] || 0) >= 4) {
+    insights.push(
+      `[PATTERN: high_oor x${signalFreq["high_oor"]}] > 70% OOR rate across multiple positions. Bin ranges too narrow for current market volatility — widen ranges or switch to lower-vol pools exclusively.`
+    );
+  }
+
+  // ── Consecutive failure detection (Evolver-style) ───────
+  // Count consecutive losses at tail
+  let consecutiveLosses = 0;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    if (recent[i].pnl_pct < 0) consecutiveLosses++;
+    else break;
+  }
+  if (consecutiveLosses >= 3) {
+    insights.push(
+      `[CRITICAL: ${consecutiveLosses} consecutive losses] Stop deploying. No new positions until you understand the pattern. Review all recent losses — what do they share? (high vol? low organic? specific pool type?) Use get_performance_history to analyze.`
+    );
+  }
+
+  // ── Saturation detection ─────────────────────────────────
+  // All recent positions neutral? Market may be too slow
+  const neutralCount = recent.filter((p) => p.pnl_pct >= -3 && p.pnl_pct <= 3).length;
+  if (neutralCount >= recent.length * 0.8 && recent.length >= 5) {
+    insights.push(
+      `[SATURATION: ${neutralCount}/${recent.length} positions near-neutral] Market may be in a low-volatility lull. Consider switching to higher bin_step pools (> 100) with wider ranges, or wait for better conditions instead of forcing deploys.`
+    );
+  }
+
+  // ── Fee strong pattern — positive signal ─────────────────
+  if ((signalFreq["fee_strong"] || 0) >= 3) {
+    insights.push(
+      `[POSITIVE: fee_strong x${signalFreq["fee_strong"]}] Fee yield > 3% consistently working. Fee/TVL is your best predictor — weight it higher when screening. Prefer pools with proven fee generation over narrative hype.`
+    );
+  }
+
+  if (insights.length === 0) return null;
+
+  return {
+    window_closes: recent.length,
+    window_start: recent[0]?.recorded_at,
+    window_end: recent[recent.length - 1]?.recorded_at,
+    signal_frequencies: signalFreq,
+    consecutive_losses: consecutiveLosses,
+    insights,
+  };
+}
+
+// ─── Lesson Retrieval ─────────────────────────────────────────
+
 /**
  * Get lessons formatted for injection into the system prompt.
  * Structured injection with three tiers:
@@ -634,6 +833,18 @@ export function getLessonsForPrompt(opts = {}) {
   const PINNED_CAP  = isAutoCycle ? 5  : 10;
   const ROLE_CAP    = isAutoCycle ? 6  : 15;
   const RECENT_CAP  = maxLessons ?? (isAutoCycle ? 10 : 35);
+
+  // ── Tier 0: Pattern Insights (Evolver-inspired) ──────────────
+  // Inject recurring pattern detection before individual lessons
+  let patternSection = "";
+  try {
+    const patterns = detectRecurringPatterns({ agentType });
+    if (patterns && patterns.insights.length > 0) {
+      patternSection = `═══ RECURRING PATTERNS (last ${patterns.window_closes} closes) ═══\n${
+        patterns.insights.map((p) => `  ⚠ ${p}`).join("\n")
+      }\n\n`;
+    }
+  } catch (_) { /* non-critical — skip if pattern detection fails */ }
 
   const outcomePriority = { bad: 0, poor: 1, failed: 1, good: 2, worked: 2, manual: 1, neutral: 3, evolution: 2 };
   const byPriority = (a, b) => (outcomePriority[a.outcome] ?? 3) - (outcomePriority[b.outcome] ?? 3);
@@ -680,12 +891,13 @@ export function getLessonsForPrompt(opts = {}) {
   if (selected.length === 0 && !shared) return null;
 
   const sections = [];
+  if (patternSection)     sections.push(patternSection.trim());
   if (pinned.length)      sections.push(`── PINNED (${pinned.length}) ──\n` + fmt(pinned));
   if (roleMatched.length) sections.push(`── ${agentType} (${roleMatched.length}) ──\n` + fmt(roleMatched));
   if (recent.length)      sections.push(`── RECENT (${recent.length}) ──\n` + fmt(recent));
   if (shared)             sections.push(`── HIVEMIND ──\n${shared}`);
 
-  return sections.join("\n\n");
+  return sections.join("\n\n") || null;
 }
 
 function fmt(lessons) {

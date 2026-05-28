@@ -34,6 +34,7 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { confirmIndicatorPreset } from "./tools/chart-indicators.js";
 
 const entrypointPath = process.env.pm_exec_path || process.argv[1];
 const isMain = entrypointPath
@@ -249,6 +250,40 @@ export async function runManagementCycle({ silent = false } = {}) {
       }
     }
 
+    // ── Evil Panda indicator exit check (RSI+BB pump exit) ──────────
+    // "Evil Panda" = exit-on-pump strategy: RSI(2)>90 + price above Bollinger upper band
+    // signals euphoria — take profit into strength rather than holding through the dump.
+    if (config.indicators.enabled) {
+      const indicatorChecks = positionData
+        .filter(p => !exitMap.has(p.position) && p.base_mint)
+        .map(async (p) => {
+          try {
+            const confirmation = await confirmIndicatorPreset({
+              mint: p.base_mint,
+              side: "exit",
+              refresh: false,
+            });
+            return { position: p.position, pair: p.pair, confirmation };
+          } catch (error) {
+            return { position: p.position, pair: p.pair, confirmation: null, error: error.message };
+          }
+        });
+      if (indicatorChecks.length > 0) {
+        // Promise.all is correct here — inner try/catch ensures no rejections
+        const indicatorResults = await Promise.all(indicatorChecks);
+        for (const { position, pair, confirmation, error } of indicatorResults) {
+          if (error) {
+            log("indicators_warn", `Management indicator check failed for ${pair}: ${error}`);
+            continue;
+          }
+          if (confirmation?.confirmed && !confirmation?.skipped) {
+            exitMap.set(position, `🔥 Evil Panda pump exit: ${confirmation.reason}`);
+            log("state", `Evil Panda pump exit for ${pair}: ${confirmation.reason}`);
+          }
+        }
+      }
+    }
+
     // ── Deterministic rule checks (no LLM) ──────────────────────────
     // action: CLOSE | CLAIM | STAY | INSTRUCTION (needs LLM)
     const actionMap = new Map();
@@ -289,7 +324,10 @@ export async function runManagementCycle({ silent = false } = {}) {
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
       let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
-      if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
+      if (act.action === "CLOSE" && act.rule === "exit") {
+        const isEvilPanda = act.reason?.includes("Evil Panda");
+        line += `\n${isEvilPanda ? "🔥 Evil Panda" : "⚡ Trailing TP"}: ${act.reason}`;
+      }
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
       return line;
@@ -334,11 +372,11 @@ RULES:
 - CLOSE: call close_position only — it handles fee claiming internally, do NOT call claim_fees first
 - CLAIM: call claim_fees with position address
 - INSTRUCTION: evaluate the instruction condition. If met → close_position. If not → HOLD, do nothing.
-- ⚡ exit alerts: close immediately, no exceptions
+- ⚡ exit alerts (Trailing TP / Evil Panda): close immediately, no exceptions
 
 Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. Just execute.
 After executing, write a brief one-line result per position.
-      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
+      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 8192, {
         onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
         onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
       });
@@ -681,7 +719,7 @@ STEPS:
 IMPORTANT:
 - Never write "unknown" for OKX. Use real values, omit missing fields, or write exactly "OKX: unavailable".
 - Keep the whole report compact and highly scannable for Telegram.
-      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
+      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 8192, {
         onToolStart: async ({ name }) => {
           if (name === "deploy_position") deployAttempted = true;
           await liveMessage?.toolStart(name);
@@ -931,6 +969,30 @@ function getDeterministicCloseRule(position, managementConfig) {
     (position.age_minutes ?? 0) >= 60
   ) {
     return { action: "CLOSE", rule: 5, reason: "low yield" };
+  }
+  // Rule 6 — Tiered time-stop: cut red positions based on severity × time
+  if (
+    !pnlSuspect &&
+    position.pnl_pct != null &&
+    position.pnl_pct < 0 &&
+    position.age_minutes != null
+  ) {
+    const pnl = position.pnl_pct;
+    const age = position.age_minutes;
+    const deepPct    = managementConfig.timeStopDeepLossPct    ?? -15;
+    const deepMin    = managementConfig.timeStopDeepLossMin    ?? 60;
+    const mediumPct  = managementConfig.timeStopMediumLossPct  ?? -5;
+    const mediumMin  = managementConfig.timeStopMediumLossMin  ?? 180;
+    const shallowMin = managementConfig.timeStopShallowLossMin ?? 360;
+    if (pnl <= deepPct && age >= deepMin) {
+      return { action: "CLOSE", rule: 6, reason: `time-stop deep loss: ${pnl.toFixed(1)}% after ${age}m` };
+    }
+    if (pnl <= mediumPct && age >= mediumMin) {
+      return { action: "CLOSE", rule: 6, reason: `time-stop medium loss: ${pnl.toFixed(1)}% after ${age}m` };
+    }
+    if (pnl < 0 && age >= shallowMin) {
+      return { action: "CLOSE", rule: 6, reason: `time-stop shallow loss: ${pnl.toFixed(1)}% after ${age}m` };
+    }
   }
   return null;
 }

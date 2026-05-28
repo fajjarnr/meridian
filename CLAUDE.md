@@ -222,6 +222,22 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 ---
 
+## Self-Improvement System (.learnings/)
+
+Structured learning log in `.learnings/` for non-performance events (errors, corrections, feature ideas). Performance events go through `lessons.js`.
+
+| File | Purpose | Promotes To |
+|------|---------|-------------|
+| `.learnings/LEARNINGS.md` | Corrections, knowledge gaps, best practices | `addLesson()` → prompt injection |
+| `.learnings/ERRORS.md` | Tool failures, API errors, crashes | CLAUDE.md (if recurring) |
+| `.learnings/FEATURE_REQUESTS.md` | Feature ideas, capability gaps | CLAUDE.md or GitHub issues |
+
+**Format**: `TYPE-YYYYMMDD-XXX` (LRN/ERR/FEAT). Review at natural breakpoints. Promote broadly useful ones to permanent memory.
+
+**Connected to lessons.js**: Use `addLesson(rule, tags)` to inject learnings into agent prompts. The VFM gate in `evolveThresholds()` auto-scores config changes before applying (threshold < 50 = rejected).
+
+---
+
 ## Known Issues / Tech Debt
 
 - `lessons.js evolveThresholds()` evolves `maxVolatility` + `minFeeTvlRatio` (wrong key names — should be `minFeeActiveTvlRatio`; `maxVolatility` doesn't exist in config at all). The evolution is a no-op for those keys.

@@ -44,6 +44,7 @@ You have access to these CLI commands:
 - organic score < 60
 - launchpad is blocked
 - fee/TVL ratio < 0.05
+- **Pool or token has previous LOSS — check `node cli.js pool-memory --pool <addr>`. If avg_pnl_pct < 0 or win_rate = 0%, REJECT. Do NOT redeploy to losing pools.**
 
 **Strong signals (favour deployment):**
 - fee/TVL ratio > 0.15
@@ -81,15 +82,21 @@ After choosing a pool candidate, the deploy parameters must be derived from REAL
 
 ### 2. Choose Strategy
 
+**DEFAULT STRATEGY: Always prefer `bid_ask` (two-sided range).** Bid-Ask provides downside AND upside coverage — protecting against both pumps and dumps. Use bid_ask for ALL pool ages unless the token is brand new (<1 hour old and launched via pump.fun).
+
+When to use other strategies (rare exceptions):
+- **New token (<1h old, pump.fun)** → custom_ratio_spot (price discovery phase)
+- **Stable, low-volatility pool** → fee_compounding
+
 Use the gathered data to match a strategy:
 
 | Data pattern | Strategy | Why |
 |-------------|----------|-----|
-| net_buyers > 0, price up, strong narrative | **custom_ratio_spot** (bullish token ratio) | Ride momentum with directional bias |
-| high volatility, degen token, pump.fun launch | **single_sided_reseed** | Expect big swings, re-seed on dumps |
-| stable volume, low volatility, fee/TVL > 0.15 | **fee_compounding** | Consistent yield, compound it |
-| mixed signals, high volume, top LPers split | **multi_layer** | Hedge with tight + wide positions |
-| high fee pool, clear TP opportunity | **partial_harvest** | Lock profits incrementally |
+| net_buyers > 0, price up, strong narrative | **bid_ask** (default two-sided) | Default: upside + downside protected |
+| high volatility, degen token, pump.fun launch | **bid_ask** | Wide range both ways — survive swings |
+| stable volume, low volatility, fee/TVL > 0.15 | **bid_ask** or fee_compounding | Consistent yield, single-side ok if very stable |
+| mixed signals, high volume, top LPers split | **bid_ask** | Two-sided coverage for uncertainty |
+| high fee pool, clear TP opportunity | **bid_ask** | Capture fees from both directions |
 
 ### 3. Per-Strategy Deploy Logic
 
@@ -149,7 +156,7 @@ Research on 3,214 top LPer positions shows: **tighter ranges outperform in every
 Calibrate with `study` data — if top LPers who win on this pool use specific bin counts, match their width.
 
 **Deploy** — standard deploy with the ratio-split amounts:
-`node cli.js deploy --pool <addr> --amount <sol_portion> --amount-x <token_amount> --bins-below <N> --bins-above <M> --strategy spot`
+`node cli.js deploy --pool <addr> --amount <sol_portion> --amount-x <token_amount> --bins-below <N> --bins-above <M> --strategy bid_ask`
 
 This is usually SUFFICIENT. The deploy is complete after this step.
 
@@ -194,7 +201,7 @@ The position stays open — same bins, same range. You're just refilling it with
 - If `study` shows narrower ranges win: tighten to ±25
 
 **Deploy** — standard two-sided spot:
-`node cli.js deploy --pool <addr> --amount <sol> --bins-below <N> --bins-above <M> --strategy spot`
+`node cli.js deploy --pool <addr> --amount <sol> --bins-below <N> --bins-above <M> --strategy bid_ask`
 
 ---
 
@@ -288,7 +295,7 @@ Only consider adding a layer when data from `pool-detail`, `token-info`, and `st
 - Use total_bins from the volatility table above, then: `bins_below = round(total_bins × 0.55)`, `bins_above = total_bins - bins_below`
 
 **Deploy** — standard:
-`node cli.js deploy --pool <addr> --amount <sol> --bins-below <N> --bins-above <M> --strategy spot`
+`node cli.js deploy --pool <addr> --amount <sol> --bins-below <N> --bins-above <M> --strategy bid_ask`
 
 ---
 

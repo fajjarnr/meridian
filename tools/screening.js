@@ -103,25 +103,33 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (pool?.base_token_has_high_single_ownership === true) return "base token has high single ownership";
   if (pool?.pool_type && pool.pool_type !== "dlmm") return `pool_type ${pool.pool_type} is not dlmm`;
 
+  // DexScreener pools skip Meteora-specific checks (bin_step, fee/TVL, volatility, organic, holders)
+  // They only have TVL, volume, and mcap data from DexScreener.
+  // However, they still need basic quality filters (volume, TVL, mcap are checked above).
+  const isDexScreener = pool?._source === "dexscreener";
+
   if (mcap == null || mcap < s.minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${s.minMcap}`;
   if (mcap > s.maxMcap) return `mcap ${mcap} above maxMcap ${s.maxMcap}`;
-  if (holders == null || holders < s.minHolders) return `holders ${holders ?? "unknown"} below minHolders ${s.minHolders}`;
   if (volume == null || volume < s.minVolume) return `volume ${volume ?? "unknown"} below minVolume ${s.minVolume}`;
   if (tvl == null || tvl < s.minTvl) return `TVL ${tvl ?? "unknown"} below minTvl ${s.minTvl}`;
   if (s.maxTvl != null && tvl > s.maxTvl) return `TVL ${tvl} above maxTvl ${s.maxTvl}`;
-  if (binStep == null || binStep < s.minBinStep) return `bin_step ${binStep ?? "unknown"} below minBinStep ${s.minBinStep}`;
-  if (binStep > s.maxBinStep) return `bin_step ${binStep} above maxBinStep ${s.maxBinStep}`;
-  if (feeActiveTvlRatio == null || feeActiveTvlRatio < s.minFeeActiveTvlRatio) {
-    return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below minFeeActiveTvlRatio ${s.minFeeActiveTvlRatio}`;
-  }
-  if (!isUsableVolatility(volatility)) {
-    return `volatility ${volatility ?? "unknown"} is unusable`;
-  }
-  if (baseOrganic == null || baseOrganic < s.minOrganic) {
-    return `base organic ${baseOrganic ?? "unknown"} below minOrganic ${s.minOrganic}`;
-  }
-  if (quoteOrganic == null || quoteOrganic < s.minQuoteOrganic) {
-    return `quote organic ${quoteOrganic ?? "unknown"} below minQuoteOrganic ${s.minQuoteOrganic}`;
+
+  if (!isDexScreener) {
+    if (holders == null || holders < s.minHolders) return `holders ${holders ?? "unknown"} below minHolders ${s.minHolders}`;
+    if (binStep == null || binStep < s.minBinStep) return `bin_step ${binStep ?? "unknown"} below minBinStep ${s.minBinStep}`;
+    if (binStep > s.maxBinStep) return `bin_step ${binStep} above maxBinStep ${s.maxBinStep}`;
+    if (feeActiveTvlRatio == null || feeActiveTvlRatio < s.minFeeActiveTvlRatio) {
+      return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below minFeeActiveTvlRatio ${s.minFeeActiveTvlRatio}`;
+    }
+    if (!isUsableVolatility(volatility)) {
+      return `volatility ${volatility ?? "unknown"} is unusable`;
+    }
+    if (baseOrganic == null || baseOrganic < s.minOrganic) {
+      return `base organic ${baseOrganic ?? "unknown"} below minOrganic ${s.minOrganic}`;
+    }
+    if (quoteOrganic == null || quoteOrganic < s.minQuoteOrganic) {
+      return `quote organic ${quoteOrganic ?? "unknown"} below minQuoteOrganic ${s.minQuoteOrganic}`;
+    }
   }
   if (
     pool?.discord_signal &&
@@ -376,6 +384,76 @@ async function refreshDiscordOnlyPools(pools, timeframe) {
 }
 
 /**
+ * Fetch DLMM pools from DexScreener that Meteora API may miss.
+ * Queries trending tokens on Solana Meteora DEX, filters DLMM only.
+ * Also discovers DLMM v2 pools that DexScreener labels.
+ */
+async function fetchDexScreenerDLMMPools() {
+  // Configurable search queries — defaults cover common meme/narrative trends
+  const queries = config.screening.dexScreenerQueries ?? ["meme", "ai", "chat", "dog", "cat", "pepe", "trump", "sol", "based"];
+  const seen = new Set();
+  const results = [];
+
+  for (const q of queries) {
+    try {
+      const url = "https://api.dexscreener.com/latest/dex/search?q=" + encodeURIComponent(q);
+      const resp = await fetch(url, { signal: AbortSignal.timeout(6000) });
+      if (!resp.ok) continue;
+      const data = await resp.json();
+      const pairs = data?.pairs || [];
+
+      for (const pair of pairs) {
+        if (pair.chainId !== "solana") continue;
+        if (pair.dexId !== "meteora") continue;
+        // Accept both DLMM and DLMM v2 labels
+        const isDLMM = pair.labels?.some(l => l === "DLMM" || l === "DLMM v2" || l.startsWith("DLMM"));
+        if (!isDLMM) continue;
+        if (pair.quoteToken?.symbol !== "SOL") continue;
+
+        const addr = pair.pairAddress;
+        if (!addr || seen.has(addr)) continue;
+        seen.add(addr);
+
+        // Map DexScreener to Meteora-compatible format
+        results.push({
+          pool_address: addr,
+          name: (pair.baseToken?.symbol || "?") + "-SOL",
+          pool_type: "dlmm",
+          tvl: pair.liquidity?.usd || 0,
+          active_tvl: pair.liquidity?.usd || 0,
+          volume: pair.volume?.h24 || 0,
+          fee: null,
+          fee_active_tvl_ratio: null,
+          volatility: null,
+          volatility_timeframe: "5m",
+          base_token_holders: null,
+          token_x: {
+            symbol: pair.baseToken?.symbol,
+            address: pair.baseToken?.address,
+            organic_score: null,
+            market_cap: pair.fdv || 0,
+            created_at: pair.pairCreatedAt ? new Date(pair.pairCreatedAt).toISOString() : null,
+            warnings: [],
+          },
+          token_y: {
+            symbol: "SOL",
+            address: "So11111111111111111111111111111111111111112",
+          },
+          dlmm_params: {},
+          fee_pct: null,
+          active_positions: null,
+          active_positions_pct: null,
+          open_positions: null,
+          _source: "dexscreener",
+        });
+      }
+    } catch (_) { /* skip failed query */ }
+  }
+
+  return results;
+}
+
+/**
  * Fetch pools from the Meteora Pool Discovery API.
  * Returns condensed data optimized for LLM consumption (saves tokens).
  */
@@ -407,14 +485,31 @@ export async function discoverPools({
       : null,
   ].filter(Boolean).join("&&");
 
-  const data = await fetchPoolDiscoveryPage({
-    page_size,
-    filters,
-    timeframe: s.timeframe,
-    category: s.category,
-  });
+  // ── Dynamic Timeframe Waterfall ──────────────────────
+  // Try the configured timeframe first, then cascade to longer ones
+  const TIMEFRAME_CASCADE = ["5m", "30m", "1h", "2h", "4h", "12h", "24h"];
+  const primaryTf = s.timeframe || "5m";
+  const tfOrder = [primaryTf, ...TIMEFRAME_CASCADE.filter(t => t !== primaryTf)];
 
-  let rawPools = Array.isArray(data.data) ? data.data : [];
+  let rawPools = [];
+  let usedTimeframe = primaryTf;
+
+  for (const tf of tfOrder) {
+    const data = await fetchPoolDiscoveryPage({
+      page_size,
+      filters,
+      timeframe: tf,
+      category: s.category,
+    });
+    rawPools = Array.isArray(data.data) ? data.data : [];
+    if (rawPools.length > 0) {
+      usedTimeframe = tf;
+      if (tf !== primaryTf) {
+        log("screening", `Timeframe cascade: ${primaryTf} returned 0 pools, using ${tf} (${rawPools.length} pools)`);
+      }
+      break;
+    }
+  }
 
   if (config.screening.useDiscordSignals) {
     const signalCandidates = await fetchDiscordSignalCandidates().catch((error) => {
@@ -439,7 +534,7 @@ export async function discoverPools({
     if (config.screening.discordSignalMode === "only") {
       rawPools = signalPools;
       // Refresh all signal pools with live data since discovery_pool is a stale snapshot
-      await refreshDiscordOnlyPools(rawPools, s.timeframe);
+      await refreshDiscordOnlyPools(rawPools, usedTimeframe);
     } else if (signalPools.length > 0) {
       const byPool = new Map(rawPools.map((pool) => [pool.pool_address, pool]));
       const discordOnlyPools = [];
@@ -462,12 +557,28 @@ export async function discoverPools({
       // Refresh discord-only pools with live data — their discovery_pool is a stale snapshot
       // so volume/volatility/fee may be 0 even when the pool is active right now
       if (discordOnlyPools.length > 0) {
-        await refreshDiscordOnlyPools(discordOnlyPools, s.timeframe);
+        await refreshDiscordOnlyPools(discordOnlyPools, usedTimeframe);
       }
     }
   }
 
-  rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
+  rawPools = await applyVolatilityTimeframe(rawPools, usedTimeframe);
+
+  // Enrich with DexScreener — discover DLMM/DLMM v2 pools not indexed by Meteora
+  try {
+    const dsPools = await fetchDexScreenerDLMMPools();
+    if (dsPools.length > 0) {
+      const existingAddresses = new Set(rawPools.map(p => p.pool_address));
+      const newPools = dsPools.filter(p => !existingAddresses.has(p.pool_address));
+      if (newPools.length > 0) {
+        log("screening", "DexScreener: adding " + newPools.length + " pool(s) not in Meteora (" + newPools.map(p => p.name).join(", ") + ")");
+        rawPools = [...rawPools, ...newPools];
+      }
+    }
+  } catch (e) {
+    log("screening", "DexScreener enrichment failed: " + e.message);
+  }
+
   await enrichDiscordSignalLaunchpads(rawPools);
 
   const filteredExamples = [];
@@ -531,7 +642,7 @@ export async function discoverPools({
   }
 
   return {
-    total: data.total,
+    total: rawPools.length,
     pools,
     filtered_examples: filteredExamples,
   };

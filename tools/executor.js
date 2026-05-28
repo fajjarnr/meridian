@@ -18,6 +18,7 @@ import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
+import { analyzeRange, calculateFibonacciRange } from "./range-analysis.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
@@ -72,6 +73,21 @@ function poolDetailVolatility(pool) {
   return numberOrNull(pool?.volatility);
 }
 
+function poolDetailMcap(pool) {
+  return numberOrNull(pool?.token_x?.market_cap ?? pool?.market_cap);
+}
+
+function getBinStepRangeForMc(mcap) {
+  const tiers = config.screening.binStepTiers || [];
+  for (const tier of tiers) {
+    if (mcap <= tier.maxMc) {
+      return { min: tier.minBinStep, max: tier.maxBinStep };
+    }
+  }
+  // Fallback to absolute defaults
+  return { min: config.screening.minBinStep ?? 80, max: config.screening.maxBinStep ?? 200 };
+}
+
 async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.timeframe || "5m") {
   const encodedTimeframe = encodeURIComponent(timeframe);
   const filter = encodeURIComponent(`pool_address=${poolAddress}`);
@@ -84,9 +100,46 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
 
 async function validateDeployPoolThresholds(args) {
   let detail;
+  let isDexScreenerFallback = false;
   try {
     detail = await fetchFreshPoolDetail(args.pool_address);
-    if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
+    if (!detail) {
+      // Try DexScreener fallback for pools not indexed by Meteora
+      try {
+        const dsUrl = `https://api.dexscreener.com/latest/dex/pairs/solana/${args.pool_address}`;
+        const dsResp = await fetch(dsUrl, { signal: AbortSignal.timeout(5000) });
+        if (dsResp.ok) {
+          const dsData = await dsResp.json();
+          const pair = dsData?.pairs?.[0];
+          if (pair && pair.dexId === "meteora") {
+            detail = {
+              pool_address: pair.pairAddress,
+              name: (pair.baseToken?.symbol || "?") + "-SOL",
+              tvl: pair.liquidity?.usd || 0,
+              active_tvl: pair.liquidity?.usd || 0,
+              volume: pair.volume?.h24 || 0,
+              fee: null,
+              fee_active_tvl_ratio: null,
+              volatility: null,
+              volatility_timeframe: "5m",
+              base_token_holders: null,
+              token_x: {
+                symbol: pair.baseToken?.symbol,
+                address: pair.baseToken?.address,
+                organic_score: null,
+                market_cap: pair.fdv || 0,
+                created_at: pair.pairCreatedAt ? new Date(pair.pairCreatedAt).toISOString() : null,
+              },
+              token_y: { symbol: "SOL" },
+              dlmm_params: {},
+              _source: "dexscreener",
+            };
+            isDexScreenerFallback = true;
+          }
+        }
+      } catch (_) { /* DexScreener fallback failed */ }
+      if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
+    }
   } catch (error) {
     return {
       pass: false,
@@ -116,9 +169,39 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
+  // TVL/MC ratio — high ratio = pool over-liquid relative to token size (OOR risk)
+  const mcap = poolDetailMcap(detail);
+  const maxTvlMcRatio = numberOrNull(config.screening.maxTvlMcRatio);
+  if (!isDexScreenerFallback && maxTvlMcRatio != null && maxTvlMcRatio > 0 && tvl > 0 && mcap > 0) {
+    const tvlMcRatio = tvl / mcap;
+    if (tvlMcRatio > maxTvlMcRatio) {
+      // Exception: insane volume can justify high TVL/MC (Meteora EDU 101)
+      const volumeException5m = config.screening.tvlmcVolumeException5m ?? 500_000;
+      let highVolume = false;
+      try {
+        const dsUrl = `https://api.dexscreener.com/latest/dex/pairs/solana/${args.pool_address}`;
+        const dsResp = await fetch(dsUrl, { signal: AbortSignal.timeout(5000) });
+        if (dsResp.ok) {
+          const dsData = await dsResp.json();
+          const pair = dsData?.pairs?.[0];
+          const vol5m = Number(pair?.volume?.m5 ?? pair?.volume?.h1 ?? 0) / 12; // approximate 5m from 1h
+          if (vol5m > volumeException5m) highVolume = true;
+        }
+      } catch (_) { /* DexScreener best-effort */ }
+      if (!highVolume) {
+        return {
+          pass: false,
+          reason: `TVL/MC ratio ${tvlMcRatio.toFixed(3)} exceeds max ${maxTvlMcRatio}. Pool is over-liquid relative to token size — high OOR risk.`,
+        };
+      }
+      if (typeof log === "function") log("safety", `TVL/MC override: ratio ${tvlMcRatio.toFixed(3)} > ${maxTvlMcRatio} but volume exception triggered (5m > $${volumeException5m})`);
+    }
+  }
+
   const feeActiveTvlRatio = poolDetailFeeActiveTvlRatio(detail);
   const minFeeActiveTvlRatio = numberOrNull(config.screening.minFeeActiveTvlRatio);
   if (
+    !isDexScreenerFallback &&
     minFeeActiveTvlRatio != null &&
     minFeeActiveTvlRatio > 0 &&
     (feeActiveTvlRatio == null || feeActiveTvlRatio < minFeeActiveTvlRatio)
@@ -131,7 +214,7 @@ async function validateDeployPoolThresholds(args) {
 
   const volatilityTimeframe = getVolatilityTimeframe(config.screening.timeframe || "5m");
   let volatilityDetail = detail;
-  if ((config.screening.timeframe || "5m") !== volatilityTimeframe) {
+  if (!isDexScreenerFallback && (config.screening.timeframe || "5m") !== volatilityTimeframe) {
     try {
       volatilityDetail = await fetchFreshPoolDetail(args.pool_address, volatilityTimeframe);
     } catch (error) {
@@ -143,7 +226,7 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const volatility = poolDetailVolatility(volatilityDetail);
-  if (volatility == null || volatility <= 0) {
+  if (!isDexScreenerFallback && (volatility == null || volatility <= 0)) {
     return {
       pass: false,
       reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
@@ -151,18 +234,21 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const actualBinStep = poolDetailBinStep(detail);
-  const minStep = numberOrNull(config.screening.minBinStep);
-  const maxStep = numberOrNull(config.screening.maxBinStep);
-  if (actualBinStep != null && minStep != null && actualBinStep < minStep) {
+  // Use MC-aware bin_step range (dynamic per token market cap)
+  const mcapForBinStep = poolDetailMcap(detail);
+  const binRange = mcapForBinStep > 0
+    ? getBinStepRangeForMc(mcapForBinStep)
+    : { min: config.screening.minBinStep ?? 80, max: config.screening.maxBinStep ?? 200 };
+  if (!isDexScreenerFallback && actualBinStep != null && binRange.min != null && actualBinStep < binRange.min) {
     return {
       pass: false,
-      reason: `Pool bin_step ${actualBinStep} is below configured minBinStep ${minStep}.`,
+      reason: `Pool bin_step ${actualBinStep} is below minBinStep ${binRange.min} for MC $${(mcapForBinStep/1000).toFixed(0)}k tier.`,
     };
   }
-  if (actualBinStep != null && maxStep != null && actualBinStep > maxStep) {
+  if (!isDexScreenerFallback && actualBinStep != null && binRange.max != null && actualBinStep > binRange.max) {
     return {
       pass: false,
-      reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
+      reason: `Pool bin_step ${actualBinStep} is above maxBinStep ${binRange.max} for MC $${(mcapForBinStep/1000).toFixed(0)}k tier.`,
     };
   }
 
@@ -252,6 +338,8 @@ const toolMap = {
   remove_smart_wallet: removeSmartWallet,
   list_smart_wallets: listSmartWallets,
   check_smart_wallets_on_pool: checkSmartWalletsOnPool,
+  analyze_range: ({ pool_address, bin_step, base_mint }) => analyzeRange(pool_address, bin_step || 100, base_mint),
+  calculate_fibonacci_range: ({ pool_address, bin_step }) => calculateFibonacciRange(pool_address, bin_step || 100),
   claim_fees: claimFees,
   close_position: closePosition,
   get_wallet_balance: getWalletBalances,
@@ -799,6 +887,236 @@ async function runSafetyChecks(name, args) {
             pass: false,
             reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
           };
+        }
+      }
+
+      // ── Pool Memory Check (tiered: bad pool vs bad entry) ──
+      const poolMem = getPoolMemory({ pool_address: args.pool_address });
+      if (poolMem.known && poolMem.avg_pnl_pct != null) {
+        const avgPnl = poolMem.avg_pnl_pct;
+        const deploys = poolMem.total_deploys || 0;
+        // Hard reject: consistently terrible pool (avg < -10%)
+        if (avgPnl < -10) {
+          return {
+            pass: false,
+            reason: `Pool ${args.pool_name || args.pool_address} has severe losses (avg PnL ${avgPnl.toFixed(1)}% across ${deploys} deploys). Hard reject — pool is genuinely bad.`,
+          };
+        }
+        // Caution zone (-10% to -3%): only allow if recent trend is improving
+        if (avgPnl < -3 && avgPnl >= -10) {
+          const history = poolMem.history || [];
+          const recentDeploys = history.slice(-3);
+          const recentAvg = recentDeploys.length > 0
+            ? recentDeploys.reduce((sum, d) => sum + (d.pnl_pct || 0), 0) / recentDeploys.length
+            : avgPnl;
+          if (recentAvg < 0) {
+            return {
+              pass: false,
+              reason: `Pool ${args.pool_name || args.pool_address} has moderate losses (avg PnL ${avgPnl.toFixed(1)}%) and recent deploys also losing (last ${recentDeploys.length}: avg ${recentAvg.toFixed(1)}%). Skip unless pool fundamentals improve.`,
+            };
+          }
+          if (typeof log === "function") log("safety", `Pool memory override: avg PnL ${avgPnl.toFixed(1)}% but recent trend positive (${recentAvg.toFixed(1)}%). Allowing re-entry.`);
+        }
+        // Mild zone (-3% to 0%): likely just bad entry timing — allow
+        if (avgPnl < 0 && avgPnl >= -3 && typeof log === "function") {
+          log("safety", `Pool memory: mild avg PnL ${avgPnl.toFixed(1)}% — likely bad entry timing, not bad pool. Allowing.`);
+        }
+      }
+
+      // ── Price Momentum + Volume Trend Check (DexScreener) ──
+      try {
+        const dsUrl = `https://api.dexscreener.com/latest/dex/pairs/solana/${args.pool_address}`;
+        const resp = await fetch(dsUrl, { signal: AbortSignal.timeout(5000) });
+        if (resp.ok) {
+          const ds = await resp.json();
+          const pair = ds?.pairs?.[0];
+          if (pair) {
+            const vol1h = Number(pair.volume?.h1 ?? 0);
+            const vol24h = Number(pair.volume?.h24 ?? 1);
+            const volRatio = vol24h > 0 ? (vol1h / vol24h) * 100 : 0;
+            const price1h = Number(pair.priceChange?.h1 ?? 0);
+
+            // 1h volume < 5% of 24h → dying pool
+            if (volRatio < 5 && vol24h > 1000) {
+              return {
+                pass: false,
+                reason: `Volume dying: 1h $${vol1h.toFixed(0)} is only ${volRatio.toFixed(1)}% of 24h $${vol24h.toFixed(0)}. Pool has no sustained activity.`,
+              };
+            }
+
+            // Absolute min 1h volume → pool too thin (EvilPanda: min $100k, we use config)
+            const minVol1h = config.screening.minVolume1h ?? 30000;
+            if (vol1h < minVol1h && vol24h > 1000) {
+              return {
+                pass: false,
+                reason: `Volume too thin: 1h $${vol1h.toFixed(0)} is below minimum $${minVol1h}. Pool doesn't have enough activity for LP.`,
+              };
+            }
+
+            // 1h price dump < -15% → falling knife
+            if (price1h < -15) {
+              return {
+                pass: false,
+                reason: `Price dumping: 1h change ${price1h.toFixed(1)}%. Don't deploy into a falling knife.`,
+              };
+            }
+
+            // 1h price pump > +50% → top-buying
+            if (price1h > 50) {
+              return {
+                pass: false,
+                reason: `Price pumping: 1h change +${price1h.toFixed(1)}%. Don't deploy at the top.`,
+              };
+            }
+
+            // DexScreener profile check — has socials/website? (EvilPanda signal)
+            const hasSocials = pair.info?.socials?.length > 0;
+            const hasWebsite = pair.info?.websites?.some(w => w.url) || pair.url;
+            if (!hasSocials && !hasWebsite && typeof log === "function") {
+              log("safety", `DexScreener profile: no socials or website for ${args.pool_name || args.pool_address} — quality concern`);
+            }
+            if (hasSocials && typeof log === "function") {
+              log("safety", `DexScreener profile: found socials for ${args.pool_name || args.pool_address} ✓`);
+            }
+          }
+        }
+      } catch (_) {
+        // DexScreener check is best-effort — don't block deploy if API fails
+        if (typeof log === "function") log("safety", `DexScreener unavailable for ${args.pool_name || args.pool_address}: price/volume checks skipped`);
+      }
+
+      // ── Min Fee/TVL Ratio ─────────────────────────────────
+      const minFeeTvl = config.screening.minFeeActiveTvlRatio ?? 0.05;
+      let deployFeeTvl = Number(args.fee_tvl_ratio ?? 0);
+      if (minFeeTvl > 0 && deployFeeTvl < minFeeTvl) {
+        // Short timeframe (5m/15m) may show 0% fee/TVL during temporary lulls.
+        // Fallback to 1h window to verify the pool is actually fee-dead vs just quiet.
+        try {
+          const detail1h = await fetchFreshPoolDetail(args.pool_address, "1h");
+          const feeTvl1h = numberOrNull(detail1h?.fee_active_tvl_ratio);
+          if (feeTvl1h != null && feeTvl1h >= minFeeTvl) {
+            if (typeof log === "function") log("safety", `Fee/TVL fallback: ${deployFeeTvl.toFixed(4)}% at screening timeframe → ${feeTvl1h.toFixed(4)}% at 1h. Allowing deploy.`);
+            deployFeeTvl = feeTvl1h;
+          } else {
+            return {
+              pass: false,
+              reason: `Fee/TVL ratio ${deployFeeTvl.toFixed(4)}% (1h fallback: ${feeTvl1h?.toFixed(4) ?? "N/A"}%) is below minimum ${minFeeTvl}%. Pool doesn't generate enough fees.`,
+            };
+          }
+        } catch (_) {
+          return {
+            pass: false,
+            reason: `Fee/TVL ratio ${deployFeeTvl.toFixed(4)} is below minimum ${minFeeTvl}. Pool doesn't generate enough fees to cover IL.`,
+          };
+        }
+      }
+
+      // ── Min Organic Score ──────────────────────────────────
+      const minOrganic = config.screening.minOrganic ?? 60;
+      const deployOrganic = Number(args.organic_score ?? 0);
+      if (deployOrganic < minOrganic) {
+        return {
+          pass: false,
+          reason: `Organic score ${deployOrganic} is below minimum ${minOrganic}. Token likely has bot/inorganic activity.`,
+        };
+      }
+
+      // ── Total Fees / MC Ratio (bundled token detection) ────
+      const minFeesMc = config.screening.minFeesToMcRatio;
+      if (minFeesMc != null && minFeesMc > 0 && args.base_mint) {
+        try {
+          const tokenInfo = await getTokenInfo({ query: args.base_mint });
+          const result = tokenInfo?.results?.[0];
+          const globalFeesSol = Number(result?.global_fees_sol ?? 0);
+          const tokenMcap = Number(result?.mcap ?? 0);
+          if (tokenMcap > 0) {
+            // Normalize: fees_SOL per $10k MC (avoids SOL price dependency)
+            const feesPer10kMc = globalFeesSol / (tokenMcap / 10000);
+            if (feesPer10kMc < minFeesMc) {
+              return {
+                pass: false,
+                reason: `Total Fees/MC ratio suspicious: ${globalFeesSol.toFixed(1)} SOL fees on $${(tokenMcap/1000).toFixed(0)}k MC = ${feesPer10kMc.toFixed(4)} SOL per $10k MC (min ${minFeesMc}). Token likely bundled or inorganic.`,
+              };
+            }
+            if (typeof log === "function") log("safety", `Fees/MC check: ${globalFeesSol.toFixed(1)} SOL / $${(tokenMcap/1000).toFixed(0)}k MC = ${feesPer10kMc.toFixed(4)} SOL/$10k (min ${minFeesMc})`);
+          }
+        } catch (_) {
+          // Token info fetch failed — don't block deploy
+        }
+      }
+
+      // ── Parkir Wallet Detection (EvilPanda signal) ──────────
+      // If >50% of top 25 non-pool holders have 0 SOL → likely dump wallets
+      if (args.base_mint) {
+        try {
+          const holdersData = await getTokenHolders({ mint: args.base_mint, limit: 50 });
+          const allHolders = holdersData?.holders || [];
+          const nonPool = allHolders.filter(h => !h.is_pool).slice(0, 25);
+          if (nonPool.length >= 10) {
+            const zeroSol = nonPool.filter(h => (h.sol_balance ?? 0) <= 0.001).length;
+            const zeroPct = (zeroSol / nonPool.length) * 100;
+            const maxZeroPct = config.screening.maxZeroSolHolderPct ?? 50;
+            if (zeroPct > maxZeroPct) {
+              return {
+                pass: false,
+                reason: `Parkir wallet alert: ${zeroSol}/${nonPool.length} (${zeroPct.toFixed(0)}%) of top holders have ≤0.001 SOL — likely dump wallets waiting to exit. Max allowed: ${maxZeroPct}%.`,
+              };
+            }
+            if (typeof log === "function") log("safety", `Parkir wallet check: ${zeroSol}/${nonPool.length} (${zeroPct.toFixed(0)}%) zero-SOL holders (max ${maxZeroPct}%)`);
+          }
+        } catch (_) {
+          // Holder fetch failed — don't block deploy
+        }
+      }
+
+      // ── Token Blacklist Check ──────────────────────────────
+      if (args.base_mint) {
+        const bl = listBlacklist();
+        const blacklisted = bl?.tokens?.some(t => t.mint === args.base_mint);
+        if (blacklisted) {
+          return {
+            pass: false,
+            reason: `Token ${args.base_mint} is blacklisted. Cannot deploy to blacklisted tokens.`,
+          };
+        }
+      }
+
+      // ── Max Deploys Per 24h (prevent gas-burn loops) ──────
+      // Reuse poolMem from the tiered PnL check above
+      if (poolMem.known && poolMem.history) {
+        const now = Date.now();
+        const dayAgo = now - 24 * 60 * 60 * 1000;
+        const recentDeploys = poolMem.history.filter(d => {
+          const ts = d?.deployed_at ? new Date(d.deployed_at).getTime() : 0;
+          return ts > dayAgo;
+        });
+        if (recentDeploys.length >= 3) {
+          return {
+            pass: false,
+            reason: `Pool ${args.pool_name || args.pool_address} has ${recentDeploys.length} deploys in last 24h. Max 3 deploys/day. Wait for cooldown.`,
+          };
+        }
+      }
+
+      // ── Consensus Override Guard (max 20% above recommendation) ──
+      const rangeOverrideMaxPct = config.screening.rangeOverrideMaxPct ?? config.screening.fibOverrideMaxPct ?? 20;
+      if (args.bins_below != null && args.pool_address && rangeOverrideMaxPct > 0) {
+        try {
+          const analysisResult = await analyzeRange(args.pool_address, args.bin_step || 100, args.base_mint);
+          const consensusRecommended = analysisResult?.consensus?.binsBelow;
+          if (consensusRecommended != null && consensusRecommended > 0) {
+            const overridePct = ((args.bins_below - consensusRecommended) / consensusRecommended) * 100;
+            const absDiff = args.bins_below - consensusRecommended;
+            if (overridePct > rangeOverrideMaxPct && absDiff > 5) {
+              return {
+                pass: false,
+                reason: `Range override too aggressive: requested ${args.bins_below} bins is ${overridePct.toFixed(0)}% above consensus recommendation of ${consensusRecommended} bins (max ${rangeOverrideMaxPct}%). Use bins_below ≤ ${Math.round(consensusRecommended * (1 + rangeOverrideMaxPct / 100))}.`,
+              };
+            }
+            if (typeof log === "function") log("safety", `Range consensus guard: ${args.bins_below} bins vs recommended ${consensusRecommended} (${overridePct.toFixed(0)}% override, max ${rangeOverrideMaxPct}%)`);
+          }
+        } catch (_) {
+          // Range check is best-effort — don't block deploy if it fails
         }
       }
 

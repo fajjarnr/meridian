@@ -30,6 +30,8 @@ tools/
   wallet.js         SOL/token balances (Helius) + Jupiter swap
   token.js          Token info/holders/narrative (Jupiter API)
   study.js          Top LPer study via LPAgent API
+  range-analysis.js Multi-technique consensus range analysis (Fibonacci, ATR, BB, VWAP, VP, Pivot)
+  rebalance.js      Dynamic in-place rebalancing and active range shifting orchestration
 ```
 
 ---
@@ -41,7 +43,7 @@ Three agent roles filter which tools the LLM can call:
 | Role | Purpose | Key Tools |
 |------|---------|-----------|
 | `SCREENER` | Find and deploy new positions | deploy_position, get_top_candidates, get_token_holders, check_smart_wallets_on_pool |
-| `MANAGER` | Manage open positions | close_position, claim_fees, swap_token, get_position_pnl, set_position_note |
+| `MANAGER` | Manage open positions | close_position, claim_fees, swap_token, get_position_pnl, set_position_note, rebalance_position |
 | `GENERAL` | Chat / manual commands | All tools |
 
 Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant set(s).
@@ -100,8 +102,9 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 
 1. **Deploy**: `deploy_position` → executor safety checks → `trackPosition()` in state.js → Telegram notify
 2. **Monitor**: management cron → `getMyPositions()` → `getPositionPnl()` → OOR detection → pool-memory snapshots
-3. **Close**: `close_position` → `recordPerformance()` in lessons.js → auto-swap base token to SOL → Telegram notify
-4. **Learn**: `evolveThresholds()` runs on performance data → updates config.screening → persists to user-config.json
+3. **Rebalance**: OOR + pool remains lucrative → `rebalance_position` → claims, withdraws, auto-swaps base to SOL, computes new consensus range, and redeploys centered on active bin
+4. **Close**: `close_position` / OOR + pool dead → `recordPerformance()` in lessons.js → auto-swap base token to SOL → Telegram notify
+5. **Learn**: `evolveThresholds()` runs on performance data → updates config.screening → persists to user-config.json
 
 ---
 

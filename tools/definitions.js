@@ -542,6 +542,23 @@ The deploy safety check will REJECT bins_below that exceed the consensus by >20%
   {
     type: "function",
     function: {
+      name: "rebalance_position",
+      description: `Close an out-of-range position and immediately deploy a new position in the same pool centered on the new active price.
+      
+      This tool is highly efficient: it claims fees, withdraws all liquidity, swaps the base token back to SOL, calculates the fresh range consensus centering on the current active bin, and redeploys the position in one command.`,
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: { type: "string", description: "The public key of the active DLMM position to rebalance (from get_my_positions)" },
+          bins_below: { type: "number", description: "Optional. Number of bins below active price. If omitted, uses multi-technique consensus." }
+        },
+        required: ["position_address"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "get_token_info",
       description: `Get token data from Jupiter (organic score, holders, audit, price stats, mcap).
 Use this to research a token before deploying or when the user asks about a token.

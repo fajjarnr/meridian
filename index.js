@@ -324,11 +324,12 @@ export async function runManagementCycle({ silent = false } = {}) {
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
       let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
-      if (act.action === "CLOSE" && act.rule === "exit") {
+      if ((act.action === "CLOSE" || act.action === "REBALANCE") && act.rule === "exit") {
         const isEvilPanda = act.reason?.includes("Evil Panda");
         line += `\n${isEvilPanda ? "🔥 Evil Panda" : "⚡ Trailing TP"}: ${act.reason}`;
       }
-      if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
+      if ((act.action === "CLOSE" || act.action === "REBALANCE") && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
+      if (act.action === "REBALANCE") line += `\n→ Rebalancing position in-place`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
       return line;
     });
@@ -370,11 +371,12 @@ ${actionBlocks}
 
 RULES:
 - CLOSE: call close_position only — it handles fee claiming internally, do NOT call claim_fees first
+- REBALANCE: call rebalance_position with position_address to close and immediately redeploy in the same pool centered on the new active price
 - CLAIM: call claim_fees with position address
 - INSTRUCTION: evaluate the instruction condition. If met → close_position. If not → HOLD, do nothing.
 - ⚡ exit alerts (Trailing TP / Evil Panda): close immediately, no exceptions
 
-Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. Just execute.
+Execute the required actions. Do NOT re-evaluate CLOSE/REBALANCE/CLAIM — rules already applied. Just execute.
 After executing, write a brief one-line result per position.
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 8192, {
         onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
@@ -953,6 +955,11 @@ function getDeterministicCloseRule(position, managementConfig) {
     position.upper_bin != null &&
     position.active_bin > position.upper_bin + managementConfig.outOfRangeBinsToClose
   ) {
+    const isLucrative = (position.fee_per_tvl_24h != null && position.fee_per_tvl_24h >= (managementConfig.minFeePerTvl24h ?? 7)) ||
+                        (tracked?.fee_tvl_ratio != null && tracked.fee_tvl_ratio >= 0.05);
+    if (isLucrative) {
+      return { action: "REBALANCE", rule: 3, reason: "pumped far above range but pool remains lucrative" };
+    }
     return { action: "CLOSE", rule: 3, reason: "pumped far above range" };
   }
   if (
@@ -961,6 +968,11 @@ function getDeterministicCloseRule(position, managementConfig) {
     position.active_bin > position.upper_bin &&
     (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
   ) {
+    const isLucrative = (position.fee_per_tvl_24h != null && position.fee_per_tvl_24h >= (managementConfig.minFeePerTvl24h ?? 7)) ||
+                        (tracked?.fee_tvl_ratio != null && tracked.fee_tvl_ratio >= 0.05);
+    if (isLucrative) {
+      return { action: "REBALANCE", rule: 4, reason: "OOR but pool remains lucrative" };
+    }
     return { action: "CLOSE", rule: 4, reason: "OOR" };
   }
   if (

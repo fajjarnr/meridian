@@ -19,6 +19,7 @@ import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStra
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { analyzeRange, calculateFibonacciRange } from "./range-analysis.js";
+import { rebalancePosition } from "./rebalance.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
@@ -342,6 +343,7 @@ const toolMap = {
   calculate_fibonacci_range: ({ pool_address, bin_step }) => calculateFibonacciRange(pool_address, bin_step || 100),
   claim_fees: claimFees,
   close_position: closePosition,
+  rebalance_position: rebalancePosition,
   get_wallet_balance: getWalletBalances,
   swap_token: swapToken,
   get_top_lpers: studyTopLPers,
@@ -633,6 +635,7 @@ const WRITE_TOOLS = new Set([
   "claim_fees",
   "close_position",
   "swap_token",
+  "rebalance_position",
 ]);
 const PROTECTED_TOOLS = new Set([
   ...WRITE_TOOLS,

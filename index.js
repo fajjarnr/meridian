@@ -7,7 +7,7 @@ import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates } from "./tools/screening.js";
+import { getTopCandidates, degenScore } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
@@ -25,7 +25,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -34,15 +34,20 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
-import { confirmIndicatorPreset } from "./tools/chart-indicators.js";
+
+import { REPO_ROOT, repoPath } from "./repo-root.js";
 
 const entrypointPath = process.env.pm_exec_path || process.argv[1];
-const isMain = entrypointPath
-  ? path.resolve(entrypointPath) === fileURLToPath(import.meta.url)
-  : false;
+const indexPath = fileURLToPath(import.meta.url);
+const isMain = process.env.pm_id != null
+  || (entrypointPath ? path.resolve(entrypointPath) === indexPath : false);
 
 if (isMain) {
   log("startup", "DLMM LP Agent starting...");
+  log("startup", `Repo: ${REPO_ROOT} | cwd: ${process.cwd()}${process.env.pm_id ? ` | PM2 id: ${process.env.pm_id}` : ""}`);
+  if (path.resolve(process.cwd()) !== path.resolve(REPO_ROOT)) {
+    log("startup_warn", `process.cwd() differs from repo root — use "npm run pm2:start" (not "pm2 start index.js" from another directory)`);
+  }
   log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
   log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
   ensureAgentId();
@@ -87,13 +92,8 @@ let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
-let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
-const _peakConfirmTimers = new Map();
-const _trailingDropConfirmTimers = new Map();
-const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
-const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
-const TRAILING_DROP_CONFIRM_DELAY_MS = 15_000;
-const TRAILING_DROP_CONFIRM_TOLERANCE_PCT = 1.0;
+// Exit/peak confirmation is now done by consecutive-tick counting in state.js
+// (registerExitSignal / confirmPeak), driven by the 3s RPC poller — no setTimeout rechecks.
 
 /** Strip <think>...</think> reasoning blocks that some models leak into output */
 function stripThink(text) {
@@ -110,53 +110,6 @@ function sanitizeUntrustedPromptText(text, maxLen = 500) {
     .trim()
     .slice(0, maxLen);
   return cleaned ? JSON.stringify(cleaned) : null;
-}
-
-function shouldUsePnlRecheck() {
-  return !config.api.lpAgentRelayEnabled;
-}
-
-function schedulePeakConfirmation(positionAddress) {
-  if (!positionAddress || _peakConfirmTimers.has(positionAddress)) return;
-
-  const timer = setTimeout(async () => {
-    _peakConfirmTimers.delete(positionAddress);
-    try {
-      const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
-      const position = result?.positions?.find((p) => p.position === positionAddress);
-      resolvePendingPeak(positionAddress, position?.pnl_pct ?? null, TRAILING_PEAK_CONFIRM_TOLERANCE);
-    } catch (error) {
-      log("state_warn", `Peak confirmation failed for ${positionAddress}: ${error.message}`);
-    }
-  }, TRAILING_PEAK_CONFIRM_DELAY_MS);
-
-  _peakConfirmTimers.set(positionAddress, timer);
-}
-
-function scheduleTrailingDropConfirmation(positionAddress) {
-  if (!positionAddress || _trailingDropConfirmTimers.has(positionAddress)) return;
-
-  const timer = setTimeout(async () => {
-    _trailingDropConfirmTimers.delete(positionAddress);
-    try {
-      const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
-      const position = result?.positions?.find((p) => p.position === positionAddress);
-      const resolved = resolvePendingTrailingDrop(
-        positionAddress,
-        position?.pnl_pct ?? null,
-        config.management.trailingDropPct,
-        TRAILING_DROP_CONFIRM_TOLERANCE_PCT,
-      );
-      if (resolved?.confirmed) {
-        log("state", `[Trailing recheck] Confirmed trailing exit for ${positionAddress} — triggering management`);
-        runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Trailing recheck management failed: ${e.message}`));
-      }
-    } catch (error) {
-      log("state_warn", `Trailing drop confirmation failed for ${positionAddress}: ${error.message}`);
-    }
-  }, TRAILING_DROP_CONFIRM_DELAY_MS);
-
-  _trailingDropConfirmTimers.set(positionAddress, timer);
 }
 
 async function runBriefing() {
@@ -194,7 +147,75 @@ async function maybeRunMissedBriefing() {
 function stopCronJobs() {
   for (const task of _cronTasks) task.stop();
   if (_cronTasks._pnlPollInterval) clearInterval(_cronTasks._pnlPollInterval);
+  if (_cronTasks._opportunityPollInterval) clearInterval(_cronTasks._opportunityPollInterval);
   _cronTasks = [];
+}
+
+/**
+ * Execute the actions decided by the deterministic rules. CLOSE/CLAIM run directly
+ * via executeTool (no LLM) — preserving all post-effects (notify, auto-swap,
+ * recordPerformance, decision-log, HiveMind). Only INSTRUCTION positions, whose
+ * free-text condition JS can't parse, are handed to the MANAGER LLM. Returns a
+ * one-line-per-position result string.
+ */
+async function executeManagementActions(actionPositions, actionMap, { liveMessage = null, cur = "$" } = {}) {
+  const lines = [];
+  const instructionPositions = [];
+
+  const mechanical = actionPositions.filter(p => actionMap.get(p.position).action !== "INSTRUCTION");
+  if (mechanical.length) {
+    log("cron", `Management: executing ${mechanical.length} mechanical action(s) — no LLM`);
+  }
+
+  for (const p of actionPositions) {
+    const act = actionMap.get(p.position);
+    if (act.action === "INSTRUCTION") { instructionPositions.push(p); continue; }
+
+    if (act.action === "CLOSE") {
+      const reason = act.reason || (act.rule ? `Rule ${act.rule}` : "rule close");
+      await liveMessage?.toolStart("close_position");
+      const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
+      const ok = res?.success !== false && !res?.error && !res?.blocked;
+      await liveMessage?.toolFinish("close_position", res, ok);
+      lines.push(`${p.pair}: ${ok ? `closed (${reason})` : `close FAILED — ${res?.error || res?.reason || "unknown"}`}`);
+    } else if (act.action === "CLAIM") {
+      await liveMessage?.toolStart("claim_fees");
+      const res = await executeTool("claim_fees", { position_address: p.position }).catch(e => ({ error: e.message }));
+      const ok = res?.success !== false && !res?.error && !res?.blocked;
+      await liveMessage?.toolFinish("claim_fees", res, ok);
+      lines.push(`${p.pair}: ${ok ? "fees claimed" : `claim FAILED — ${res?.error || res?.reason || "unknown"}`}`);
+    }
+  }
+
+  // INSTRUCTION positions need the LLM to evaluate the free-text condition.
+  if (instructionPositions.length > 0) {
+    log("cron", `Management: ${instructionPositions.length} instruction position(s) — invoking LLM [model: ${config.llm.managementModel}]`);
+    const actionBlocks = instructionPositions.map((p) => [
+      `POSITION: ${p.pair} (${p.position})`,
+      `  pool: ${p.pool}`,
+      `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
+      `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
+      `  instruction: "${p.instruction}"`,
+    ].join("\n")).join("\n\n");
+
+    const { content } = await agentLoop(`
+INSTRUCTION EVALUATION — ${instructionPositions.length} position(s)
+
+${actionBlocks}
+
+For each position, evaluate the instruction condition against the live data:
+- If the condition is MET → call close_position (it claims fees internally; do NOT call claim_fees first).
+- If NOT met → HOLD, do nothing.
+
+After evaluating, write a brief one-line result per position.
+    `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
+      onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
+      onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+    });
+    if (content) lines.push(content);
+  }
+
+  return lines.join("\n");
 }
 
 export async function runManagementCycle({ silent = false } = {}) {
@@ -227,60 +248,16 @@ export async function runManagementCycle({ silent = false } = {}) {
       return { ...p, recall: recallForPool(p.pool) };
     });
 
-    // JS trailing TP check
+    // JS exit checks. Management is the slow cron backstop: raise peak immediately
+    // (confirmTicks=1) and act on detected exits directly. Real-time 2-tick
+    // confirmation lives in the fast 3s poller below.
     const exitMap = new Map();
     for (const p of positionData) {
-      if (
-        !p.pnl_pct_suspicious &&
-        queuePeakConfirmation(p.position, p.pnl_pct, { immediate: !shouldUsePnlRecheck() }) &&
-        shouldUsePnlRecheck()
-      ) {
-        schedulePeakConfirmation(p.position);
-      }
+      confirmPeak(p.position, p.pnl_pct, 1);
       const exit = updatePnlAndCheckExits(p.position, p, config.management);
       if (exit) {
-        if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
-          if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
-            scheduleTrailingDropConfirmation(p.position);
-          }
-          continue;
-        }
         exitMap.set(p.position, exit.reason);
         log("state", `Exit alert for ${p.pair}: ${exit.reason}`);
-      }
-    }
-
-    // ── Evil Panda indicator exit check (RSI+BB pump exit) ──────────
-    // "Evil Panda" = exit-on-pump strategy: RSI(2)>90 + price above Bollinger upper band
-    // signals euphoria — take profit into strength rather than holding through the dump.
-    if (config.indicators.enabled) {
-      const indicatorChecks = positionData
-        .filter(p => !exitMap.has(p.position) && p.base_mint)
-        .map(async (p) => {
-          try {
-            const confirmation = await confirmIndicatorPreset({
-              mint: p.base_mint,
-              side: "exit",
-              refresh: false,
-            });
-            return { position: p.position, pair: p.pair, confirmation };
-          } catch (error) {
-            return { position: p.position, pair: p.pair, confirmation: null, error: error.message };
-          }
-        });
-      if (indicatorChecks.length > 0) {
-        // Promise.all is correct here — inner try/catch ensures no rejections
-        const indicatorResults = await Promise.all(indicatorChecks);
-        for (const { position, pair, confirmation, error } of indicatorResults) {
-          if (error) {
-            log("indicators_warn", `Management indicator check failed for ${pair}: ${error}`);
-            continue;
-          }
-          if (confirmation?.confirmed && !confirmation?.skipped) {
-            exitMap.set(position, `🔥 Evil Panda pump exit: ${confirmation.reason}`);
-            log("state", `Evil Panda pump exit for ${pair}: ${confirmation.reason}`);
-          }
-        }
       }
     }
 
@@ -324,12 +301,8 @@ export async function runManagementCycle({ silent = false } = {}) {
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
       let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
-      if ((act.action === "CLOSE" || act.action === "REBALANCE") && act.rule === "exit") {
-        const isEvilPanda = act.reason?.includes("Evil Panda");
-        line += `\n${isEvilPanda ? "🔥 Evil Panda" : "⚡ Trailing TP"}: ${act.reason}`;
-      }
-      if ((act.action === "CLOSE" || act.action === "REBALANCE") && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
-      if (act.action === "REBALANCE") line += `\n→ Rebalancing position in-place`;
+      if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
+      if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
       return line;
     });
@@ -350,42 +323,10 @@ export async function runManagementCycle({ silent = false } = {}) {
     });
 
     if (actionPositions.length > 0) {
-      log("cron", `Management: ${actionPositions.length} action(s) needed — invoking LLM [model: ${config.llm.managementModel}]`);
-
-      const actionBlocks = actionPositions.map((p) => {
-        const act = actionMap.get(p.position);
-        return [
-          `POSITION: ${p.pair} (${p.position})`,
-          `  pool: ${p.pool}`,
-          `  action: ${act.action}${act.rule && act.rule !== "exit" ? ` — Rule ${act.rule}: ${act.reason}` : ""}${act.rule === "exit" ? ` — ⚡ Trailing TP: ${act.reason}` : ""}`,
-          `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
-          `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
-          p.instruction ? `  instruction: "${p.instruction}"` : null,
-        ].filter(Boolean).join("\n");
-      }).join("\n\n");
-
-      const { content } = await agentLoop(`
-MANAGEMENT ACTION REQUIRED — ${actionPositions.length} position(s)
-
-${actionBlocks}
-
-RULES:
-- CLOSE: call close_position only — it handles fee claiming internally, do NOT call claim_fees first
-- REBALANCE: call rebalance_position with position_address to close and immediately redeploy in the same pool centered on the new active price
-- CLAIM: call claim_fees with position address
-- INSTRUCTION: evaluate the instruction condition. If met → close_position. If not → HOLD, do nothing.
-- ⚡ exit alerts (Trailing TP / Evil Panda): close immediately, no exceptions
-
-Execute the required actions. Do NOT re-evaluate CLOSE/REBALANCE/CLAIM — rules already applied. Just execute.
-After executing, write a brief one-line result per position.
-      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 8192, {
-        onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
-        onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
-      });
-
-      mgmtReport += `\n\n${content}`;
+      const execReport = await executeManagementActions(actionPositions, actionMap, { liveMessage, cur });
+      if (execReport) mgmtReport += `\n\n${execReport}`;
     } else {
-      log("cron", "Management: all positions STAY — skipping LLM");
+      log("cron", "Management: all positions STAY — skipping");
       await liveMessage?.note("No tool actions needed.");
     }
 
@@ -475,9 +416,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     // Load active strategy
     const activeStrategy = getActiveStrategy();
-    const strategyBlock = activeStrategy
-      ? `ACTIVE STRATEGY: ${activeStrategy.name} — LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED — never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
-      : `No active strategy — use default bid_ask, bins_above: 0, SOL only.`;
+    const deployStrategy = config.strategy.strategy;
+    const strategyBlock = `DEPLOY STRATEGY: ${deployStrategy} (from config) | bins_above: 0 (FIXED — never change) | deposit: SOL only (amount_y, amount_x=0)`
+      + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "");
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
     const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
@@ -589,25 +530,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const netBuyers = ti?.stats_1h?.net_buyers;
       const activeBin = activeBinResults[i]?.status === "fulfilled" ? activeBinResults[i].value?.binId : null;
 
-      // OKX signals
-      const okxParts = [
-        pool.risk_level     != null ? `risk=${pool.risk_level}`               : null,
-        pool.bundle_pct     != null ? `bundle=${pool.bundle_pct}%`            : null,
-        pool.sniper_pct     != null ? `sniper=${pool.sniper_pct}%`            : null,
-        pool.suspicious_pct != null ? `suspicious=${pool.suspicious_pct}%`    : null,
-        pool.new_wallet_pct != null ? `new_wallets=${pool.new_wallet_pct}%`   : null,
-        pool.is_rugpull != null ? `rugpull=${pool.is_rugpull ? "YES" : "NO"}` : null,
-        pool.is_wash != null ? `wash=${pool.is_wash ? "YES" : "NO"}` : null,
-      ].filter(Boolean).join(", ");
-      const okxUnavailable = !okxParts && pool.price_vs_ath_pct == null;
-
-      const okxTags = [
-        pool.smart_money_buy    ? "smart_money_buy"    : null,
-        pool.kol_in_clusters    ? "kol_in_clusters"    : null,
-        pool.dex_boost          ? "dex_boost"          : null,
-        pool.dex_screener_paid  ? "dex_screener_paid"  : null,
-        pool.dev_sold_all       ? "dev_sold_all(bullish)" : null,
-      ].filter(Boolean).join(", ");
       const pvpLine = pool.is_pvp
         ? `  pvp: HIGH — rival ${pool.pvp_rival_name || pool.pvp_symbol} (${pool.pvp_rival_mint?.slice(0, 8)}...) has pool ${pool.pvp_rival_pool?.slice(0, 8)}..., tvl=$${pool.pvp_rival_tvl}, holders=${pool.pvp_rival_holders}, fees=${pool.pvp_rival_fees}SOL`
         : null;
@@ -617,9 +539,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
-        okxParts ? `  okx: ${okxParts}` : okxUnavailable ? `  okx: unavailable` : null,
-        okxTags  ? `  tags: ${okxTags}` : null,
-        pool.price_vs_ath_pct != null ? `  ath: price_vs_ath=${pool.price_vs_ath_pct}%${pool.top_cluster_trend ? `, top_cluster=${pool.top_cluster_trend}` : ""}` : null,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
@@ -698,11 +617,6 @@ STEPS:
    Fees paid: <x> SOL
    Smart wallets: <names or none>
 
-   RISK
-   <If OKX advanced/risk data exists, list only the fields that actually exist: Risk level, Bundle, Sniper, Suspicious, ATH distance, Rugpull, Wash.>
-   <If only rugpull/wash exist, list just those.>
-   <If OKX enrichment is missing, write exactly: OKX: unavailable>
-
    WHY THIS WON
    <2-4 concise sentences on why this pool won, key risks, and why it still beat the alternatives>
 5. If no pool qualifies, report in this exact format instead:
@@ -719,9 +633,8 @@ STEPS:
    REJECTED
    <short flat list of top candidate names and why they were skipped>
 IMPORTANT:
-- Never write "unknown" for OKX. Use real values, omit missing fields, or write exactly "OKX: unavailable".
 - Keep the whole report compact and highly scannable for Telegram.
-      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 8192, {
+      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
         onToolStart: async ({ name }) => {
           if (name === "deploy_position") deployAttempted = true;
           await liveMessage?.toolStart(name);
@@ -803,7 +716,13 @@ Summarize the current portfolio health, total fees earned, and performance of al
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
 
-  // Lightweight 30s PnL poller — updates trailing TP state between management cycles, no LLM
+  // Fast PnL poller — the real-time exit path between management cycles, no LLM.
+  // Runs on public infra (RPC + Jupiter + Meteora deposits) so it can poll aggressively.
+  // Exits require `confirmTicks` consecutive confirming polls (registerExitSignal) so a
+  // single noisy tick can't close a position; confirmed exits close DIRECTLY here (no
+  // management-interval cooldown gate that used to swallow rule hits).
+  const pnlPollMs = Math.max(1, Number(config.pnl.pollIntervalSec ?? 3)) * 1000;
+  const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
   let _pnlPollBusy = false;
   const pnlPollInterval = setInterval(async () => {
     if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
@@ -813,55 +732,101 @@ Summarize the current portfolio health, total fees earned, and performance of al
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
       if (!result?.positions?.length) return;
       for (const p of result.positions) {
-        if (
-          !p.pnl_pct_suspicious &&
-          queuePeakConfirmation(p.position, p.pnl_pct, { immediate: !shouldUsePnlRecheck() }) &&
-          shouldUsePnlRecheck()
-        ) {
-          schedulePeakConfirmation(p.position);
-        }
+        confirmPeak(p.position, p.pnl_pct, confirmTicks);
+
+        // Detect an exit signal this tick (rule-based exits, then deterministic close rules).
         const exit = updatePnlAndCheckExits(p.position, p, config.management);
-        if (exit) {
-          if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
-            if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
-              scheduleTrailingDropConfirmation(p.position);
-            }
-            continue;
-          }
-          const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
-          const sinceLastTrigger = Date.now() - _pollTriggeredAt;
-          if (sinceLastTrigger >= cooldownMs) {
-            _pollTriggeredAt = Date.now();
-            log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — triggering management`);
-            runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
-          } else {
-            log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
-          }
-          break;
+        const closeRule = exit ? null : getDeterministicCloseRule(p, config.management);
+        let signal = null, reason = null, rule = "exit";
+        if (exit) { signal = exit.action; reason = exit.reason; }
+        else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; rule = closeRule.rule; }
+
+        // Require N consecutive confirming ticks before acting.
+        const { fire } = registerExitSignal(p.position, signal, confirmTicks);
+        if (!signal || !fire) continue;
+
+        log("state", `[PnL poll] ${signal} confirmed (${confirmTicks} ticks): ${p.pair} — ${reason} — closing directly`);
+        // Hold the management lock so the cron cycle can't double-act on this position.
+        _managementBusy = true;
+        try {
+          const actMap = new Map([[p.position, { action: "CLOSE", rule, reason }]]);
+          const rpt = await executeManagementActions([p], actMap, {});
+          log("state", `[PnL poll] ${p.pair}: ${rpt || "closed"}`);
+        } catch (e) {
+          log("cron_error", `Poll-triggered close failed: ${e.message}`);
+        } finally {
+          _managementBusy = false;
         }
-        const closeRule = getDeterministicCloseRule(p, config.management);
-        if (closeRule) {
-          const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
-          const sinceLastTrigger = Date.now() - _pollTriggeredAt;
-          if (sinceLastTrigger >= cooldownMs) {
-            _pollTriggeredAt = Date.now();
-            log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — triggering management`);
-            runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
-          } else {
-            log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
-          }
-          break;
-        }
+        break; // one action per tick
       }
     } finally {
       _pnlPollBusy = false;
     }
-  }, 30_000);
+  }, pnlPollMs);
+
+  // Opportunity poller — catches strong pools between the (slow) screening cycles.
+  // Reuses the getTopCandidates pipeline (discovery + holder audit + filters + score);
+  // when the best candidate clears the score pre-gate it triggers the existing screening
+  // deploy decision (runScreeningCycle), which re-checks guards and forces the deploy LLM.
+  let opportunityPollInterval = null;
+  if (config.opportunity.enabled) {
+    const oppMs = Math.max(15, Number(config.opportunity.pollIntervalSec ?? 45)) * 1000;
+    const oppCooldownMs = 5 * 60 * 1000; // don't re-trigger the deploy LLM more than every 5m
+    let _opportunityPollBusy = false;
+    opportunityPollInterval = setInterval(async () => {
+      if (_screeningBusy || _managementBusy || _opportunityPollBusy) return;
+      if (Date.now() - _screeningLastTriggered < oppCooldownMs) return;
+      _opportunityPollBusy = true;
+      try {
+        const [positions, balance] = await Promise.all([
+          getMyPositions({ force: true, silent: true }).catch(() => null),
+          getWalletBalances().catch(() => null),
+        ]);
+        if (!positions || (positions.total_positions ?? 0) >= config.risk.maxPositions) return;
+        const minRequired = config.management.deployAmountSol + config.management.gasReserve;
+        if (process.env.DRY_RUN !== "true" && (!balance || balance.sol < minRequired)) return;
+
+        const top = await getTopCandidates({ limit: config.opportunity.limit }).catch(() => null);
+        const candidates = (top?.candidates || []).slice().sort((a, b) => degenScore(b, config.opportunity) - degenScore(a, config.opportunity));
+        if (!candidates.length) return;
+
+        const minScore = config.opportunity.minScore;
+        const bonus = Number(config.opportunity.smartWalletScoreBonus ?? 0);
+        const floor = minScore - bonus; // lowest degen that could qualify, only WITH a smart wallet
+
+        // A pool qualifies if degen >= minScore, OR it's borderline (floor..minScore) AND a
+        // tracked smart wallet sits on it (checkSmartWalletsOnPool, on-chain positions of our
+        // tracked KOL list). The smart-wallet lookup runs only for borderline pools to keep
+        // the 45s poll cheap.
+        let trigger = null;
+        for (const c of candidates) {
+          const s = degenScore(c, config.opportunity);
+          if (s < floor) break; // sorted desc — nothing below can qualify either
+          if (s >= minScore) { trigger = { c, s, smart: [] }; break; }
+          if (bonus <= 0) continue; // borderline but smart-wallet rescue disabled
+          const smart = (await checkSmartWalletsOnPool({ pool_address: c.pool }).catch(() => null))?.in_pool || [];
+          if (smart.length > 0) { trigger = { c, s, smart }; break; }
+        }
+        if (!trigger) return;
+
+        const smartTag = trigger.smart.length
+          ? ` + smart wallet [${trigger.smart.map((w) => w.name || w.address?.slice(0, 4)).join(", ")}] (bar lowered ${minScore}→${floor})`
+          : "";
+        log("cron", `[Opportunity] ${trigger.c.name} degen ${trigger.s.toFixed(1)} >= ${trigger.smart.length ? floor : minScore}${smartTag} — triggering screening deploy decision`);
+        runScreeningCycle({ silent: true }).catch((e) => log("cron_error", `Opportunity-triggered screening failed: ${e.message}`));
+      } catch (e) {
+        log("cron_error", `Opportunity poll failed: ${e.message}`);
+      } finally {
+        _opportunityPollBusy = false;
+      }
+    }, oppMs);
+  }
 
   _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
-  // Store interval ref so stopCronJobs can clear it
+  // Store interval refs so stopCronJobs can clear them
   _cronTasks._pnlPollInterval = pnlPollInterval;
-  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
+  _cronTasks._opportunityPollInterval = opportunityPollInterval;
+  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m${config.opportunity.enabled ? `, opportunity poll every ${config.opportunity.pollIntervalSec}s` : ""}`);
 }
 
 // ═══════════════════════════════════════════
@@ -935,6 +900,8 @@ function formatCandidates(candidates) {
 function getDeterministicCloseRule(position, managementConfig) {
   const tracked = getTrackedPosition(position.position);
   const pnlSuspect = (() => {
+    // Couldn't-price-this-tick flag (e.g. Jupiter outage) — never act on PnL rules.
+    if (position.pnl_pct_suspicious) return true;
     if (position.pnl_pct == null) return false;
     if (position.pnl_pct > -90) return false;
     if (tracked?.amount_sol && (position.total_value_usd ?? 0) > 0.01) {
@@ -955,11 +922,6 @@ function getDeterministicCloseRule(position, managementConfig) {
     position.upper_bin != null &&
     position.active_bin > position.upper_bin + managementConfig.outOfRangeBinsToClose
   ) {
-    const isLucrative = (position.fee_per_tvl_24h != null && position.fee_per_tvl_24h >= (managementConfig.minFeePerTvl24h ?? 7)) ||
-                        (tracked?.fee_tvl_ratio != null && tracked.fee_tvl_ratio >= 0.05);
-    if (isLucrative) {
-      return { action: "REBALANCE", rule: 3, reason: "pumped far above range but pool remains lucrative" };
-    }
     return { action: "CLOSE", rule: 3, reason: "pumped far above range" };
   }
   if (
@@ -968,11 +930,6 @@ function getDeterministicCloseRule(position, managementConfig) {
     position.active_bin > position.upper_bin &&
     (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
   ) {
-    const isLucrative = (position.fee_per_tvl_24h != null && position.fee_per_tvl_24h >= (managementConfig.minFeePerTvl24h ?? 7)) ||
-                        (tracked?.fee_tvl_ratio != null && tracked.fee_tvl_ratio >= 0.05);
-    if (isLucrative) {
-      return { action: "REBALANCE", rule: 4, reason: "OOR but pool remains lucrative" };
-    }
     return { action: "CLOSE", rule: 4, reason: "OOR" };
   }
   if (
@@ -981,30 +938,6 @@ function getDeterministicCloseRule(position, managementConfig) {
     (position.age_minutes ?? 0) >= 60
   ) {
     return { action: "CLOSE", rule: 5, reason: "low yield" };
-  }
-  // Rule 6 — Tiered time-stop: cut red positions based on severity × time
-  if (
-    !pnlSuspect &&
-    position.pnl_pct != null &&
-    position.pnl_pct < 0 &&
-    position.age_minutes != null
-  ) {
-    const pnl = position.pnl_pct;
-    const age = position.age_minutes;
-    const deepPct    = managementConfig.timeStopDeepLossPct    ?? -15;
-    const deepMin    = managementConfig.timeStopDeepLossMin    ?? 60;
-    const mediumPct  = managementConfig.timeStopMediumLossPct  ?? -5;
-    const mediumMin  = managementConfig.timeStopMediumLossMin  ?? 180;
-    const shallowMin = managementConfig.timeStopShallowLossMin ?? 360;
-    if (pnl <= deepPct && age >= deepMin) {
-      return { action: "CLOSE", rule: 6, reason: `time-stop deep loss: ${pnl.toFixed(1)}% after ${age}m` };
-    }
-    if (pnl <= mediumPct && age >= mediumMin) {
-      return { action: "CLOSE", rule: 6, reason: `time-stop medium loss: ${pnl.toFixed(1)}% after ${age}m` };
-    }
-    if (pnl < 0 && age >= shallowMin) {
-      return { action: "CLOSE", rule: 6, reason: `time-stop shallow loss: ${pnl.toFixed(1)}% after ${age}m` };
-    }
   }
   return null;
 }
@@ -1410,7 +1343,7 @@ async function deployLatestCandidate(index) {
     }
   }
   const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
-  const binsBelow = computeBinsBelow(candidate.volatility, candidate.bin_step, candidate.mcap);
+  const binsBelow = computeBinsBelow(candidate.volatility);
   const result = await executeTool("deploy_position", {
     pool_address: candidate.pool,
     amount_y: deployAmount,
@@ -1747,15 +1680,17 @@ function fmtPct(value) {
 
 function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   if (!pool) return "missing candidate data";
-  const smartWalletCount = Math.max(sw?.in_pool?.length ?? 0, Number(pool.gmgn_smart_wallets ?? 0) || 0);
   const tokenInfo = ti || {};
   const hasNarrative = !!n?.narrative;
+  // Degen Score is the conviction signal for a solo deploy. Smart wallet is NO LONGER a
+  // gate here — it's a confidence boost surfaced to the LLM, not a requirement.
+  const degen = degenScore(pool, config.opportunity);
+  const degenStrong = degen >= (config.screening.loneCandidateMinDegen ?? 50);
   const globalFeesSol = Number(tokenInfo.global_fees_sol ?? pool.gmgn_total_fee_sol);
   const top10Pct = Number(tokenInfo.audit?.top_holders_pct ?? pool.gmgn_token_info_top10_pct ?? pool.gmgn_top10_holder_pct);
   const botPct = Number(tokenInfo.audit?.bot_holders_pct ?? pool.gmgn_bot_degen_pct);
-  if (pool.is_wash) return "wash trading was flagged";
-  if (pool.is_rugpull && smartWalletCount === 0) return "rugpull risk was flagged and no smart wallets offset it";
-  if (pool.is_pvp && smartWalletCount === 0) return "PVP symbol conflict and no smart-wallet confirmation";
+
+  // Hard fundamental gates — no override.
   if (Number.isFinite(globalFeesSol) && globalFeesSol < config.screening.minTokenFeesSol) {
     return `token fees ${globalFeesSol} SOL below minimum ${config.screening.minTokenFeesSol} SOL`;
   }
@@ -1765,40 +1700,26 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   if (Number.isFinite(botPct) && botPct > config.screening.maxBotHoldersPct) {
     return `bot holders ${botPct}% above maximum ${config.screening.maxBotHoldersPct}%`;
   }
-  if (!hasNarrative && smartWalletCount === 0) return "only candidate has no narrative and no smart-wallet confirmation";
+
+  // PVP conflict needs strong conviction (degen) to deploy solo.
+  if (pool.is_pvp && !degenStrong) {
+    return `PVP symbol conflict without strong degen conviction (degen ${degen.toFixed(1)} < ${config.screening.loneCandidateMinDegen ?? 50})`;
+  }
+  // Conviction: a solo deploy needs a narrative OR a strong degen score.
+  if (!hasNarrative && !degenStrong) {
+    return `only candidate has no narrative and weak degen score (${degen.toFixed(1)} < ${config.screening.loneCandidateMinDegen ?? 50})`;
+  }
   return null;
 }
 
-function computeBinsBelow(volatility, binStep = 100, marketCap = 0) {
-  const binStepPct = binStep / 100;
-  if (binStepPct <= 0) return 35;
-
-  let targetDropPct = 35; // Fallback floor
-
-  if (config.strategy.downsideMode === "static") {
-    targetDropPct = config.strategy.downsidePct ?? 90;
-  } else if (config.strategy.downsideMode === "volatility") {
-    // Linear scale between 35% and 90% based on volatility 0-5+
-    const parsedVol = Math.max(0, Number(volatility || 0));
-    targetDropPct = 35 + Math.min(55, (parsedVol / 5) * 55);
-  } else {
-    // "graduated" mode (Default Option C)
-    const mc = Number(marketCap || 0);
-    if (mc < 1_000_000) {
-      targetDropPct = 90; // Tier 1: Microcap -> Full venufitratama14 safety
-    } else if (mc < 5_000_000) {
-      targetDropPct = 60; // Tier 2: Mid-cap -> Optimized safety/yield balance
-    } else {
-      targetDropPct = 35; // Tier 3: Established -> Max yield density
-    }
+function computeBinsBelow(volatility) {
+  const parsedVolatility = Number(volatility);
+  if (!Number.isFinite(parsedVolatility) || parsedVolatility <= 0) {
+    throw new Error(`Invalid volatility ${volatility ?? "unknown"} — refusing volatility-scaled deploy.`);
   }
-
-  const calculatedBins = Math.round(targetDropPct / binStepPct);
-
-  // Still apply global min/max clamps for safety
-  const minBins = Math.max(35, config.strategy.minBinsBelow ?? 35);
-  const maxBins = config.strategy.maxBinsBelow ?? 120;
-  return Math.max(minBins, Math.min(maxBins, calculatedBins));
+  const lo = config.strategy.minBinsBelow;
+  const hi = config.strategy.maxBinsBelow;
+  return Math.max(lo, Math.min(hi, Math.round(lo + (parsedVolatility / 5) * (hi - lo))));
 }
 
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
@@ -1995,7 +1916,6 @@ Commands:
       console.log(`  maxTvl:               ${s.maxTvl}`);
       console.log(`  minVolume:            ${s.minVolume}`);
       console.log(`  minTokenFeesSol:      ${s.minTokenFeesSol}`);
-      console.log(`  maxBundlePct:         ${s.maxBundlePct}`);
       console.log(`  maxBotHoldersPct:     ${s.maxBotHoldersPct}`);
       console.log(`  maxTop10Pct:          ${s.maxTop10Pct}`);
       console.log(`  timeframe:            ${s.timeframe}`);
@@ -2069,7 +1989,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
           return;
         }
         const fs = await import("fs");
-        const lessonsData = JSON.parse(fs.default.readFileSync("./lessons.json", "utf8"));
+        const lessonsData = JSON.parse(fs.default.readFileSync(repoPath("lessons.json"), "utf8"));
         const result = evolveThresholds(lessonsData.performance, config);
         if (!result || Object.keys(result.changes).length === 0) {
           console.log("\nNo threshold changes needed — current settings already match performance data.\n");

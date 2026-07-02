@@ -7,15 +7,13 @@
  */
 
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 import { getSharedLessonsForPrompt, pushHiveLesson, pushHivePerformanceEvent } from "./hivemind.js";
+import { repoPath } from "./repo-root.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
+const USER_CONFIG_PATH = repoPath("user-config.json");
 
-const LESSONS_FILE = "./lessons.json";
+const LESSONS_FILE = repoPath("lessons.json");
 const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
 const MAX_CHANGE_PER_STEP  = 0.20; // never shift a threshold more than 20% at once
 const PERFORMANCE_SIGNAL_FIELDS = [
@@ -29,6 +27,9 @@ const PERFORMANCE_SIGNAL_FIELDS = [
   "study_win_rate",
   "hive_consensus",
   "volatility",
+  "entry_mcap",
+  "entry_tvl",
+  "entry_volume",
 ];
 const MAX_MANUAL_LESSON_LENGTH = 400;
 
@@ -174,6 +175,12 @@ export async function recordPerformance(perf) {
       close_reason: perf.close_reason,
       strategy: perf.strategy,
       volatility: perf.volatility,
+      entry_mcap: perf.entry_mcap,
+      entry_tvl: perf.entry_tvl,
+      entry_volume: perf.entry_volume,
+      exit_mcap: perf.exit_mcap,
+      exit_tvl: perf.exit_tvl,
+      exit_volume: perf.exit_volume,
     });
   }
 
@@ -272,8 +279,9 @@ function derivLesson(perf) {
 
   if (outcome === "neutral") return null; // nothing interesting to learn
 
-  // Build context description
-  const context = [
+  // Build context description with entry/exit market conditions
+  const fmtNum = (n) => n == null ? "?" : n >= 1_000_000 ? `${(n/1_000_000).toFixed(1)}M` : n >= 1_000 ? `${(n/1_000).toFixed(0)}K` : String(Math.round(n));
+  const contextParts = [
     `${perf.pool_name}`,
     `strategy=${perf.strategy}`,
     `bin_step=${perf.bin_step}`,
@@ -281,7 +289,14 @@ function derivLesson(perf) {
     `fee_tvl_ratio=${perf.fee_tvl_ratio}`,
     `organic=${perf.organic_score}`,
     `bin_range=${typeof perf.bin_range === 'object' ? JSON.stringify(perf.bin_range) : perf.bin_range}`,
-  ].join(", ");
+  ];
+  if (perf.entry_mcap != null || perf.entry_tvl != null || perf.entry_volume != null) {
+    contextParts.push(`entry(mcap=${fmtNum(perf.entry_mcap)}, tvl=${fmtNum(perf.entry_tvl)}, vol=${fmtNum(perf.entry_volume)})`);
+  }
+  if (perf.exit_mcap != null || perf.exit_tvl != null || perf.exit_volume != null) {
+    contextParts.push(`exit(mcap=${fmtNum(perf.exit_mcap)}, tvl=${fmtNum(perf.exit_tvl)}, vol=${fmtNum(perf.exit_volume)})`);
+  }
+  const context = contextParts.join(", ");
 
   let rule = "";
 
@@ -290,7 +305,8 @@ function derivLesson(perf) {
       rule = `AVOID: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
       tags.push("oor", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
     } else if (perf.range_efficiency > 80 && outcome === "good") {
-      rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
+      const entryNote = perf.entry_mcap != null ? ` Entry: mcap=${fmtNum(perf.entry_mcap)}, tvl=${fmtNum(perf.entry_tvl)}, vol=${fmtNum(perf.entry_volume)}.` : "";
+      rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.${entryNote}`;
       tags.push("efficient", perf.strategy);
     } else if (outcome === "bad" && perf.close_reason?.includes("volume")) {
       rule = `AVOID: Pools with fee_tvl_ratio=${perf.fee_tvl_ratio} that showed volume collapse — fees evaporated quickly. Minimum sustained volume check needed before deploying.`;
@@ -342,6 +358,12 @@ function derivLesson(perf) {
     range_efficiency: perf.range_efficiency,
     close_reason: perf.close_reason,
     pool: perf.pool,
+    entry_mcap: perf.entry_mcap ?? null,
+    entry_tvl: perf.entry_tvl ?? null,
+    entry_volume: perf.entry_volume ?? null,
+    exit_mcap: perf.exit_mcap ?? null,
+    exit_tvl: perf.exit_tvl ?? null,
+    exit_volume: perf.exit_volume ?? null,
     created_at: new Date().toISOString(),
   };
 }
@@ -407,6 +429,7 @@ export function evolveThresholds(perfData, config) {
 
   // ── 2. minFeeActiveTvlRatio ───────────────────────────────────
   // Raise the floor if low-fee pools consistently underperform.
+  // Raise the floor if low-fee pools consistently underperform.
   {
     const winnerFees = winners.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
     const loserFees  = losers.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
@@ -445,7 +468,7 @@ export function evolveThresholds(perfData, config) {
     }
   }
 
-  // ── 3. minOrganic ─────────────────────────────────────────────
+  // ── 2. minOrganic ─────────────────────────────────────────────
   // Raise organic floor if low-organic tokens consistently failed.
   {
     const loserOrganics  = losers.map((p) => p.organic_score).filter(isFiniteNum);

@@ -136,13 +136,17 @@ Before calling deploy_position, you MUST call get_pool_detail(pool_address, time
 2. VOLUME TREND:
    - Compare current volume vs 24h average. If 1h volume < 5% of 24h volume → pool is dying, REJECT.
    - Volume should be active and sustained, not a one-time spike.
+   - **Volume Trend Ratio (\`volume_trend\`)**: Values >1.0 indicate volume is accelerating, while <1.0 means it is cooling down. Dynamically prioritize pools with \`volume_trend\` ≥ 1.0 during active market screening, but allow <1.0 for established consolidation pools if they yield high projected fees.
 
-3. ENTRY TIMING:
-   - Don't deploy during extreme volatility events (e.g., -30% dump or +100% pump in <1h).
-   - Wait for consolidation — price should show signs of stabilization before entry.
-   - If price is mid-dump with no support visible → SKIP, even if other metrics look good.
+3. PROJECTED FEE YIELD (Tokleo-inspired):
+   - **Projected Fee/TVL Ratio (\`projected_fee_active_tvl_ratio\`)**: This metric incorporates recent fee momentum into the standard 24h ratio. A pool with high projected Fee/TVL is actively generating fees relative to its TVL right now. Seek candidates with high projected yields to recover IL faster.
 
-4. POST-ANALYSIS RULE:
+4. TOKEN DISTRIBUTION & WASH RISK:
+   - **MC/Holder Ratio (\`mc_per_holder\`)**: Measures market cap per holder. 
+     * MC/Holder < $500: Healthy, distributed retail ownership (low wash/dump risk).
+     * MC/Holder > $1,500: Concentrated/manipulated (high risk of wash trading or developer dump). Use caution or deprioritize.
+
+5. POST-ANALYSIS RULE:
    - If get_pool_detail fails or returns incomplete data → SKIP. No data = no deploy.
    - Document your analysis in the deploy reasoning: "1h change: X%, volume trend: Y, entry: good/bad because Z."
 

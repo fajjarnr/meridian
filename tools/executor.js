@@ -21,6 +21,7 @@ import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { analyzeRange, calculateFibonacciRange } from "./range-analysis.js";
 import { rebalancePosition } from "./rebalance.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
+import { checkGmgnToken } from "./gmgn.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
@@ -224,12 +225,34 @@ async function validateDeployPoolThresholds(args) {
     }
   }
 
-  const volatility = poolDetailVolatility(volatilityDetail);
+  let volatility = poolDetailVolatility(volatilityDetail);
   if (!isDexScreenerFallback && (volatility == null || volatility <= 0)) {
-    return {
-      pass: false,
-      reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
-    };
+    // Fallback: estimate volatility from DexScreener price changes
+    try {
+      const dsUrl = `https://api.dexscreener.com/latest/dex/pairs/solana/${args.pool_address}`;
+      const dsResp = await fetch(dsUrl, { signal: AbortSignal.timeout(5000) });
+      if (dsResp.ok) {
+        const dsData = await dsResp.json();
+        const dsPair = dsData?.pair ?? dsData?.pairs?.[0];
+        if (dsPair) {
+          const h1  = Math.abs(Number(dsPair.priceChange?.h1  ?? 0));
+          const h6  = Math.abs(Number(dsPair.priceChange?.h6  ?? 0));
+          const h24 = Math.abs(Number(dsPair.priceChange?.h24 ?? 0));
+          if (h1 > 0 || h6 > 0 || h24 > 0) {
+            const estimatedVol = (h1 * 0.5 + h6 * 0.3 + h24 * 0.2) / 5;
+            volatility = Math.max(0.5, Math.min(estimatedVol, 10));
+            log(`⚡ Volatility fallback from DexScreener: h1=${h1.toFixed(1)}%, h6=${h6.toFixed(1)}%, h24=${h24.toFixed(1)}% → estimated vol ${volatility.toFixed(2)}`);
+          }
+        }
+      }
+    } catch (_) { /* fallback failed, proceed to reject */ }
+
+    if (volatility == null || volatility <= 0) {
+      return {
+        pass: false,
+        reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
+      };
+    }
   }
 
   const actualBinStep = poolDetailBinStep(detail);
@@ -349,6 +372,7 @@ const toolMap = {
   remove_smart_wallet: removeSmartWallet,
   list_smart_wallets: listSmartWallets,
   check_smart_wallets_on_pool: checkSmartWalletsOnPool,
+  check_gmgn_token: checkGmgnToken,
   analyze_range: ({ pool_address, bin_step, base_mint }) => analyzeRange(pool_address, bin_step || 100, base_mint),
   calculate_fibonacci_range: ({ pool_address, bin_step }) => calculateFibonacciRange(pool_address, bin_step || 100),
   claim_fees: claimFees,
@@ -753,6 +777,112 @@ export async function executeTool(name, args) {
     }
   }
 
+  // ─── AST Dual-Pool Auto-Deploy ─────────────
+  // When anti_sawtooth is active and deploying bid_ask, auto-split:
+  // 80% → BidAsk (main wide range), 20% → Curve (consolidation zone)
+  if (name === "deploy_position") {
+    const _isAstDualPool = (() => {
+      try {
+        const lib = JSON.parse(fs.readFileSync(path.join(__dirname, "../strategy-library.json"), "utf8"));
+        return lib.active === "anti_sawtooth" && (args.strategy === "bid_ask" || !args.strategy);
+      } catch { return false; }
+    })();
+
+    if (_isAstDualPool) {
+      const totalAmount = Number(args.amount_y ?? args.amount_sol ?? 0);
+      if (totalAmount > 0.2) {  // Only dual-pool if enough SOL to split meaningfully
+        const bidAskAmount = +(totalAmount * 0.8).toFixed(4);
+        const curveAmount = +(totalAmount * 0.2).toFixed(4);
+        const bidAskBins = Number(args.bins_below ?? 100);
+        // Curve pool: tighter range focused on consolidation zone (40% of BidAsk range)
+        const curveBins = Math.max(35, Math.round(bidAskBins * 0.4));
+
+        log("executor", `AST DUAL-POOL: splitting ${totalAmount} SOL → ${bidAskAmount} BidAsk + ${curveAmount} Curve`);
+
+        // 1. Deploy main BidAsk position (80%)
+        const bidAskArgs = { ...args, amount_sol: bidAskAmount, amount_y: bidAskAmount, strategy: "bid_ask" };
+        const bidAskResult = await fn(bidAskArgs);
+        const bidAskSuccess = bidAskResult?.success !== false && !bidAskResult?.error && !bidAskResult?.blocked;
+
+        if (bidAskSuccess) {
+          // 2. Deploy Curve position (20%) — same pool, tighter range
+          const curveArgs = {
+            ...args,
+            amount_sol: curveAmount,
+            amount_y: curveAmount,
+            strategy: "curve",
+            bins_below: curveBins,
+            bins_above: curveBins,  // Curve is symmetric around active bin
+          };
+          try {
+            const curveResult = await fn(curveArgs);
+            const curveSuccess = curveResult?.success !== false && !curveResult?.error && !curveResult?.blocked;
+
+            const duration = Date.now() - startTime;
+            const combinedResult = {
+              success: true,
+              dual_pool: true,
+              main_position: {
+                strategy: "bid_ask",
+                amount_sol: bidAskAmount,
+                bins_below: bidAskBins,
+                position: bidAskResult.position,
+                tx: bidAskResult.txs?.[0] ?? bidAskResult.tx,
+              },
+              second_position: curveSuccess ? {
+                strategy: "curve",
+                amount_sol: curveAmount,
+                bins_below: curveBins,
+                position: curveResult.position,
+                tx: curveResult.txs?.[0] ?? curveResult.tx,
+              } : {
+                strategy: "curve",
+                error: curveResult?.reason || curveResult?.error || "Curve deploy failed",
+              },
+              pool_address: args.pool_address,
+              pool_name: args.pool_name,
+              total_sol: totalAmount,
+              message: `AST dual-pool deployed: ${bidAskAmount} SOL BidAsk (${bidAskBins} bins) + ${curveAmount} SOL Curve (${curveBins} bins)${curveSuccess ? "" : " [Curve failed: " + (curveResult?.reason || curveResult?.error) + "]"}`,
+            };
+
+            logAction({ tool: name, args, result: summarizeResult(combinedResult), duration_ms: duration, success: true });
+
+            // Notify for main position
+            notifyDeploy({
+              pair: combinedResult.pool_name || args.pool_name || args.pool_address?.slice(0, 8),
+              amountSol: totalAmount,
+              position: bidAskResult.position,
+              tx: bidAskResult.txs?.[0] ?? bidAskResult.tx,
+              priceRange: bidAskResult.price_range,
+              binStep: bidAskResult.bin_step,
+            }).catch(() => {});
+
+            return combinedResult;
+          } catch (curveError) {
+            // Curve failed but BidAsk succeeded — return partial success
+            log("executor_warn", `AST dual-pool: Curve deploy failed (${curveError.message}), BidAsk succeeded`);
+            return {
+              success: true,
+              dual_pool: true,
+              main_position: {
+                strategy: "bid_ask",
+                amount_sol: bidAskAmount,
+                position: bidAskResult.position,
+                tx: bidAskResult.txs?.[0] ?? bidAskResult.tx,
+              },
+              second_position: { strategy: "curve", error: curveError.message },
+              message: `AST BidAsk deployed (${bidAskAmount} SOL). Curve pool failed: ${curveError.message}`,
+            };
+          }
+        } else {
+          // BidAsk failed — don't try Curve
+          log("safety_block", `AST dual-pool: BidAsk deploy failed, skipping Curve`);
+          return bidAskResult;
+        }
+      }
+    }
+  }
+
   // ─── Execute ──────────────────────────────
   try {
     const result = await fn(args);
@@ -817,7 +947,7 @@ export async function executeTool(name, args) {
 /**
  * Run safety checks before executing write operations.
  */
-async function runSafetyChecks(name, args) {
+export async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
       const poolThresholds = await validateDeployPoolThresholds(args);
@@ -889,7 +1019,7 @@ async function runSafetyChecks(name, args) {
       ) {
         return {
           pass: false,
-          reason: "Single-side SOL deploy must use bins_above=0.",
+          reason: "Single-side SOL deploy must use bins_above=0 (Meteora SDK constraint). Use wide bins_below for Bengshark range.",
         };
       }
 
@@ -901,18 +1031,31 @@ async function runSafetyChecks(name, args) {
           reason: `Max positions (${config.risk.maxPositions}) reached. Close a position first.`,
         };
       }
-      const alreadyInPool = positions.positions.some(
+      // AST dual-pool: allow same pool if strategy differs (e.g. BidAsk + Curve)
+      const existingInPool = positions.positions.filter(
         (p) => p.pool === args.pool_address
       );
-      if (alreadyInPool) {
-        return {
-          pass: false,
-          reason: `Already have an open position in pool ${args.pool_address}. Cannot open duplicate.`,
-        };
+      if (existingInPool.length > 0) {
+        const hasSameStrategy = existingInPool.some(
+          (p) => (p.strategy || 'bid_ask') === (args.strategy || 'bid_ask')
+        );
+        if (hasSameStrategy) {
+          return {
+            pass: false,
+            reason: `Already have an open position with same strategy in pool ${args.pool_address}. Cannot open duplicate.`,
+          };
+        }
+        // Different strategy = allowed (AST dual pool: BidAsk + Curve)
+        if (existingInPool.length >= 2) {
+          return {
+            pass: false,
+            reason: `Already have 2 positions in pool ${args.pool_address}. Max 2 per pool (dual pool).`,
+          };
+        }
       }
 
-      // Block same base token across different pools
-      if (args.base_mint) {
+      // Block same base token across different pools (but allow dual pool in same pool)
+      if (args.base_mint && existingInPool.length === 0) {
         const alreadyHasMint = positions.positions.some(
           (p) => p.base_mint === args.base_mint
         );
@@ -1006,12 +1149,25 @@ async function runSafetyChecks(name, args) {
             const volRatio = vol24h > 0 ? (vol1h / vol24h) * 100 : 0;
             const price1h = Number(pair.priceChange?.h1 ?? 0);
 
-            // 1h volume < 5% of 24h → dying pool
-            if (volRatio < 5 && vol24h > 1000) {
-              return {
-                pass: false,
-                reason: `Volume dying: 1h $${vol1h.toFixed(0)} is only ${volRatio.toFixed(1)}% of 24h $${vol24h.toFixed(0)}. Pool has no sustained activity.`,
-              };
+            // Graduated volume dying check — threshold scales with 24h volume
+            const dyingThreshold = vol24h < 50000 ? 5
+              : vol24h < 200000 ? 3
+              : 1.5;
+
+            if (volRatio < dyingThreshold && vol24h > 1000) {
+              // Grace clause: pool still generating consistent volume = not truly dead
+              // Small stack: lower thresholds to match config.screening.minVolume1h
+              const minVol1hConfig = config.screening.minVolume1h ?? 5000;
+              const graceTvl24h = vol24h < 50000 ? 30000 : 50000; // Lower for small pools
+              const poolStillActive = vol24h > graceTvl24h && vol1h >= minVol1hConfig;
+              if (!poolStillActive) {
+                return {
+                  pass: false,
+                  reason: `Volume dying: 1h $${vol1h.toFixed(0)} is only ${volRatio.toFixed(1)}% of 24h $${vol24h.toFixed(0)} (threshold: ${dyingThreshold}%). Pool activity fading.`,
+                };
+              }
+              // Pool passed grace clause — log but allow
+              log(`⚠️ Volume ratio ${volRatio.toFixed(1)}% below ${dyingThreshold}% but grace clause passed (24h>$${graceTvl24h}, 1h>=$${minVol1hConfig}). Allowing.`);
             }
 
             // Absolute min 1h volume → pool too thin (EvilPanda: min $100k, we use config)
@@ -1024,7 +1180,9 @@ async function runSafetyChecks(name, args) {
             }
 
             // 1h price dump < -15% → falling knife
-            if (price1h < -15) {
+            // But skip check if price change is extreme (±95%) — likely data glitch
+            // from fresh DexScreener pools or missing historical reference
+            if (price1h < -15 && price1h > -95) {
               return {
                 pass: false,
                 reason: `Price dumping: 1h change ${price1h.toFixed(1)}%. Don't deploy into a falling knife.`,
@@ -1032,7 +1190,8 @@ async function runSafetyChecks(name, args) {
             }
 
             // 1h price pump > +50% → top-buying
-            if (price1h > 50) {
+            // But skip check if price change is extreme (>95%) — likely data glitch
+            if (price1h > 50 && price1h < 95) {
               return {
                 pass: false,
                 reason: `Price pumping: 1h change +${price1h.toFixed(1)}%. Don't deploy at the top.`,
@@ -1168,8 +1327,13 @@ async function runSafetyChecks(name, args) {
         }
       }
 
-      // ── Consensus Override Guard (max 20% above recommendation) ──
-      const rangeOverrideMaxPct = config.screening.rangeOverrideMaxPct ?? config.screening.fibOverrideMaxPct ?? 20;
+      // ── Consensus Override Guard (max ±20% around recommendation) ──
+      let rangeOverrideMaxPct = config.screening.rangeOverrideMaxPct ?? config.screening.fibOverrideMaxPct ?? 20;
+      // AST strategy uses deliberately wide ranges (100+ bins) — relax ceiling to 100% override
+      const _astActiveForRangeGuard = (() => { try { const lib = JSON.parse(fs.readFileSync(path.join(__dirname, "../strategy-library.json"), "utf8")); return lib.active === "anti_sawtooth"; } catch { return false; } })();
+      if (_astActiveForRangeGuard && (args.strategy === "bid_ask" || !args.strategy)) {
+        rangeOverrideMaxPct = 100;
+      }
       if (args.bins_below != null && args.pool_address && rangeOverrideMaxPct > 0) {
         try {
           const analysisResult = await analyzeRange(args.pool_address, args.bin_step || 100, args.base_mint);
@@ -1180,14 +1344,209 @@ async function runSafetyChecks(name, args) {
             if (overridePct > rangeOverrideMaxPct && absDiff > 5) {
               return {
                 pass: false,
-                reason: `Range override too aggressive: requested ${args.bins_below} bins is ${overridePct.toFixed(0)}% above consensus recommendation of ${consensusRecommended} bins (max ${rangeOverrideMaxPct}%). Use bins_below ≤ ${Math.round(consensusRecommended * (1 + rangeOverrideMaxPct / 100))}.`,
+                reason: `Range override too aggressive (ceiling): requested ${args.bins_below} bins is ${overridePct.toFixed(0)}% above consensus recommendation of ${consensusRecommended} bins (max ${rangeOverrideMaxPct}%). Use bins_below ≤ ${Math.round(consensusRecommended * (1 + rangeOverrideMaxPct / 100))}.`,
               };
             }
-            if (typeof log === "function") log("safety", `Range consensus guard: ${args.bins_below} bins vs recommended ${consensusRecommended} (${overridePct.toFixed(0)}% override, max ${rangeOverrideMaxPct}%)`);
+            // Floor guard: reject if requested range is significantly narrower than consensus
+            const floorBins = Math.round(consensusRecommended * (1 - rangeOverrideMaxPct / 100));
+            if (args.bins_below < floorBins && Math.abs(absDiff) > 5) {
+              return {
+                pass: false,
+                reason: `Range override too narrow (floor): requested ${args.bins_below} bins is ${Math.abs(overridePct).toFixed(0)}% below consensus recommendation of ${consensusRecommended} bins (max ${rangeOverrideMaxPct}% narrowing). Use bins_below ≥ ${floorBins}.`,
+              };
+            }
+            if (typeof log === "function") log("safety", `Range consensus guard: ${args.bins_below} bins vs recommended ${consensusRecommended} (${overridePct.toFixed(0)}% override, max ±${rangeOverrideMaxPct}%)`);
           }
         } catch (_) {
           // Range check is best-effort — don't block deploy if it fails
         }
+      }
+
+      // ── AST Strategy Hard Gates ─────────────────────────────
+      // When anti_sawtooth is active, enforce @glu_sol's model at code level
+      const _astActive = (() => { try { const lib = JSON.parse(fs.readFileSync(path.join(__dirname, "../strategy-library.json"), "utf8")); return lib.active === "anti_sawtooth"; } catch { return false; } })();
+      if (_astActive && args.strategy !== "curve") {
+        // 1. bin_step must be 100 (2% fee tier) — HARD GATE
+        const astBinStep = Number(args.bin_step ?? 0);
+        if (astBinStep !== 100) {
+          return {
+            pass: false,
+            reason: `AST strategy requires bin_step=100 (2% fee tier). Got bin_step=${astBinStep}. Pick a pool with bin_step=100.`,
+          };
+        }
+
+        // 2. bins_below must be >= 100 (-72% downside coverage) — HARD GATE
+        const astBinsBelow = Number(args.bins_below ?? 0);
+        if (astBinsBelow < 100) {
+          return {
+            pass: false,
+            reason: `AST strategy requires bins_below >= 100 (-72% downside coverage). Got bins_below=${astBinsBelow}. Widen the range.`,
+          };
+        }
+
+        // 3. MCAP must be > $10M
+        if (args.base_mint) {
+          let astMcap = null;
+
+          // Priority 1: screening data (most reliable — already filtered)
+          const screeningMcap = Number(args.mcap ?? args.market_cap ?? 0);
+          if (screeningMcap > 0) astMcap = screeningMcap;
+
+          // Priority 2: DexScreener (reliable, real-time)
+          if (astMcap == null) {
+            try {
+              const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${args.base_mint}`;
+              const dexResp = await fetch(dexUrl, { signal: AbortSignal.timeout(8000) });
+              if (dexResp.ok) {
+                const dexData = await dexResp.json();
+                const solPairs = (dexData.pairs || []).filter(p => p.chainId === "solana");
+                if (solPairs.length > 0) {
+                  const dexMcap = Math.max(...solPairs.map(p => Number(p.marketCap ?? 0)));
+                  if (dexMcap > 0) astMcap = dexMcap;
+                }
+              }
+            } catch (_) {}
+          }
+
+          // Priority 3: OKX (may return stale/wrong MCAP)
+          if (astMcap == null) {
+            try {
+              const { getPriceInfo } = await import("./okx.js");
+              const priceInfo = await getPriceInfo(args.base_mint);
+              if (priceInfo?.market_cap != null && Number(priceInfo.market_cap) > 1000) {
+                astMcap = Number(priceInfo.market_cap);
+              }
+            } catch (_) {}
+          }
+
+          // Debug log
+          if (typeof log === "function") log("safety", `AST MCAP check: base_mint=${args.base_mint?.slice(0,8)}, pool=${args.pool_address?.slice(0,8)}, mcap=${astMcap}, args.mcap=${args.mcap}`);
+
+          // Enforce
+          if (astMcap != null && astMcap > 0 && astMcap < 10_000_000) {
+            return {
+              pass: false,
+              reason: `AST strategy requires MCAP > $10M. Token MCAP is $${(astMcap/1e6).toFixed(2)}M. Wait for growth or use a different strategy.`,
+            };
+          }
+          if (astMcap == null) {
+            return {
+              pass: false,
+              reason: `AST strategy requires MCAP > $10M. Unable to verify MCAP for ${args.base_mint?.slice(0,8)} — all data sources failed. BLOCKING deploy (fail-closed).`,
+            };
+          }
+        }
+
+        // 4. ATH Fibonacci entry gate
+        if (args.base_mint) {
+          try {
+            const { getPriceInfo } = await import("./okx.js");
+            const priceInfo = await getPriceInfo(args.base_mint);
+            if (typeof log === "function") log("safety", `AST Fib raw: price=${priceInfo?.price}, ath=${priceInfo?.ath}, source=${priceInfo?._source}`);
+            if (priceInfo && priceInfo.ath > 0 && priceInfo.price > 0) {
+              const { computeAthFibonacci } = await import("./range-analysis.js");
+              const fibResult = computeAthFibonacci(priceInfo.price, priceInfo.ath, Number(args.bin_step || 100));
+              if (fibResult.valid) {
+                if (fibResult.entry_assessment === "TOO_EARLY") {
+                  return {
+                    pass: false,
+                    reason: `AST Fib gate: price only ${fibResult.retrace_from_ath_pct}% below ATH ($${priceInfo.ath.toFixed(6)}). Need >= 20% retrace for AST entry. Wait for pullback.`,
+                  };
+                }
+                if (fibResult.entry_assessment === "REJECT") {
+                  return {
+                    pass: false,
+                    reason: `AST Fib gate: price ${fibResult.retrace_from_ath_pct}% below ATH. Token retraced >70% from ATH — past AST limit. Skip.`,
+                  };
+                }
+                if (typeof log === "function") log("safety", `AST Fib check: ${fibResult.retrace_from_ath_pct}% retrace, zone=${fibResult.current_zone}, entry=${fibResult.entry_assessment}`);
+              }
+            }
+          } catch (_) {
+            return {
+              pass: false,
+              reason: `AST Fib entry gate: unable to verify ATH data for ${args.base_mint?.slice(0,8)}. BLOCKING deploy (fail-closed).`,
+            };
+          }
+        }
+
+        // 5. Volume must be > $1M in 5 minutes (high-activity pool)
+        if (args.base_mint) {
+          try {
+            const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${args.base_mint}`;
+            const dexResp = await fetch(dexUrl, { signal: AbortSignal.timeout(8000) });
+            if (dexResp.ok) {
+              const dexData = await dexResp.json();
+              const pairs = dexData.pairs || [];
+              const solPairs = pairs.filter(p => p.chainId === "solana");
+              if (solPairs.length > 0) {
+                const vol5m = Math.max(...solPairs.map(p => Number(p.volume?.m5 ?? 0)));
+                if (vol5m < 1_000_000) {
+                  return {
+                    pass: false,
+                    reason: `AST strategy requires Volume > $1M in 5min. Got $${(vol5m/1e3).toFixed(0)}K/5min. Pool activity too low.`,
+                  };
+                }
+              }
+            }
+          } catch (_) {
+            return {
+              pass: false,
+              reason: `AST Volume gate: unable to verify 5min volume for ${args.base_mint?.slice(0,8)}. BLOCKING deploy (fail-closed).`,
+            };
+          }
+        }
+
+        // 6. Momentum Score must be >= 60 (@dikibagast composite metric)
+        if (args.base_mint) {
+          try {
+            const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${args.base_mint}`;
+            const dexResp = await fetch(dexUrl, { signal: AbortSignal.timeout(8000) });
+            if (dexResp.ok) {
+              const dexData = await dexResp.json();
+              const pairs = dexData.pairs || [];
+              const solPair = pairs.find(p => p.chainId === "solana");
+              if (solPair) {
+                const priceChange5m = Math.abs(Number(solPair.priceChange?.m5 ?? 0));
+                const volumeChange = Number(solPair.volume?.change5m ?? 0);
+                const feeTvlRatio = Number(args.fee_active_tvl_ratio ?? 0);
+
+                let scoreSum = 0;
+                let factorCount = 0;
+
+                // 1. Raw 5m Price Change (max 40)
+                if (priceChange5m > 0) { scoreSum += Math.min(40, priceChange5m); factorCount++; }
+                // 2. Volume Acceleration (binary 30)
+                if (volumeChange > 0) { scoreSum += 30; factorCount++; }
+                // 3. Fee/TVL Ratio (max 30)
+                if (feeTvlRatio > 0) { scoreSum += Math.min(30, feeTvlRatio * 100); factorCount++; }
+                // 4. Price Velocity (double weight, max 30)
+                if (priceChange5m > 0) { scoreSum += Math.min(30, priceChange5m * 2); factorCount++; }
+
+                if (factorCount > 0) {
+                  const momentumScore = Math.round(scoreSum * (3 / factorCount));
+                  if (momentumScore < 60) {
+                    return {
+                      pass: false,
+                      reason: `AST Momentum gate: score ${momentumScore}/100 (need ≥60). Factors: ${factorCount}. Pool activity too low.`,
+                    };
+                  }
+                  if (typeof log === "function") log("safety", `AST Momentum check: score=${momentumScore}, factors=${factorCount}`);
+                }
+              }
+            }
+          } catch (_) {
+            return {
+              pass: false,
+              reason: `AST Momentum gate: unable to verify momentum for ${args.base_mint?.slice(0,8)}. BLOCKING deploy (fail-closed).`,
+            };
+          }
+        }
+
+        // 7. Retrace must be < 70% from ATH (already checked in Fib gate above, but double-check)
+        // This is handled by the REJECT check in Fib gate (now rejects at 70%)
+
+        if (typeof log === "function") log("safety", `AST gates passed: bin_step=${args.bin_step || "default"}, bins_below=${args.bins_below || "default"}`);
       }
 
       return { pass: true };

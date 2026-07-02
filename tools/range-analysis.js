@@ -628,6 +628,64 @@ export async function analyzeRange(poolAddress, binStep = 100, baseMint = null) 
   };
 }
 
+/**
+ * Compute Fibonacci retracement levels from ATH for AST strategy.
+ * Unlike computeFibonacci (24h swing), this uses the all-time high price.
+ *
+ * @param {number} currentPrice - Current token price in USD
+ * @param {number} athPrice - All-time high price in USD
+ * @param {number} binStep - Pool bin step in bps (default 100)
+ * @returns {Object} Fib levels + entry zone assessment
+ */
+export function computeAthFibonacci(currentPrice, athPrice, binStep = 100) {
+  if (!currentPrice || !athPrice || athPrice <= 0 || currentPrice <= 0) {
+    return { valid: false, reason: "Missing price or ATH data" };
+  }
+
+  const retracePct = ((athPrice - currentPrice) / athPrice) * 100;
+
+  const levels = {
+    "0.236": athPrice * (1 - 0.236),
+    "0.382": athPrice * (1 - 0.382),
+    "0.500": athPrice * (1 - 0.500),
+    "0.618": athPrice * (1 - 0.618),
+    "0.702": athPrice * (1 - 0.702),
+    "0.786": athPrice * (1 - 0.786),
+  };
+
+  let currentZone = "above_0.236";
+  if (currentPrice <= levels["0.786"]) currentZone = "below_0.786";
+  else if (currentPrice <= levels["0.702"]) currentZone = "0.702_to_0.786";
+  else if (currentPrice <= levels["0.618"]) currentZone = "0.618_to_0.702";
+  else if (currentPrice <= levels["0.500"]) currentZone = "0.500_to_0.618";
+  else if (currentPrice <= levels["0.382"]) currentZone = "0.382_to_0.500";
+  else if (currentPrice <= levels["0.236"]) currentZone = "0.236_to_0.382";
+
+  let entryAssessment;
+  if (retracePct < 20) entryAssessment = "TOO_EARLY";
+  else if (retracePct <= 40) entryAssessment = "IDEAL";
+  else if (retracePct <= 62) entryAssessment = "GOOD";
+  else if (retracePct <= 70) entryAssessment = "LATE";
+  else entryAssessment = "REJECT";
+
+  const dropTo786 = ((currentPrice - levels["0.786"]) / currentPrice) * 100;
+  const binsTo786 = Math.max(1, Math.round(Math.max(0, dropTo786) / (binStep / 100)));
+
+  return {
+    valid: true,
+    ath: athPrice,
+    current_price: currentPrice,
+    retrace_from_ath_pct: parseFloat(retracePct.toFixed(1)),
+    current_zone: currentZone,
+    entry_assessment: entryAssessment,
+    levels: Object.fromEntries(
+      Object.entries(levels).map(([k, v]) => [k, parseFloat(v.toFixed(10))])
+    ),
+    bins_to_786_fib: binsTo786,
+    reasoning: `Price at ${retracePct.toFixed(1)}% retrace from ATH ($${athPrice.toFixed(8)}). Zone: ${currentZone}. Entry: ${entryAssessment}. Need ${binsTo786} bins to cover down to 0.786 Fib.`,
+  };
+}
+
 // Also export for backward compatibility with fibonacci.js
 export async function calculateFibonacciRange(poolAddress, binStep = 100) {
   return analyzeRange(poolAddress, binStep);

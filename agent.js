@@ -5,7 +5,7 @@ import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
 const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance", "rebalance_position"]);
-const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions", "get_pool_detail", "calculate_fibonacci_range", "analyze_range"]);
+const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "check_gmgn_token", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions", "get_pool_detail", "calculate_fibonacci_range", "analyze_range"]);
 const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "self_update",
   "update_config",
@@ -29,7 +29,7 @@ const GENERAL_INTENT_ONLY_TOOLS = new Set([
 // Intent → tool subsets for GENERAL role
 const INTENT_TOOLS = {
   decisions:   new Set(["get_recent_decisions"]),
-  deploy:      new Set(["deploy_position", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note", "analyze_range", "calculate_fibonacci_range"]),
+  deploy:      new Set(["deploy_position", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "check_gmgn_token", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note", "analyze_range", "calculate_fibonacci_range"]),
   close:       new Set(["close_position", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token", "rebalance_position"]),
   claim:       new Set(["claim_fees", "get_my_positions", "get_position_pnl", "get_wallet_balance"]),
   swap:        new Set(["swap_token", "get_wallet_balance"]),
@@ -39,7 +39,7 @@ const INTENT_TOOLS = {
   balance:     new Set(["get_wallet_balance", "get_my_positions", "get_wallet_positions"]),
   positions:   new Set(["get_my_positions", "get_position_pnl", "get_wallet_balance", "set_position_note", "get_wallet_positions", "rebalance_position"]),
   strategy:    new Set(["list_strategies", "get_strategy", "add_strategy", "update_strategy", "delete_strategy", "remove_strategy", "set_active_strategy"]),
-  screen:      new Set(["get_top_candidates", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "check_smart_wallets_on_pool", "get_pool_detail", "get_my_positions", "discover_pools"]),
+  screen:      new Set(["get_top_candidates", "get_token_holders", "check_gmgn_token", "get_token_narrative", "get_token_info", "search_pools", "check_smart_wallets_on_pool", "get_pool_detail", "get_my_positions", "discover_pools"]),
   memory:      new Set(["get_pool_memory", "add_pool_note", "list_blacklist", "add_to_blacklist", "remove_from_blacklist"]),
   smartwallet: new Set(["add_smart_wallet", "remove_smart_wallet", "list_smart_wallets", "check_smart_wallets_on_pool"]),
   study:       new Set(["study_top_lpers", "get_top_lpers", "get_pool_detail", "search_pools", "get_token_info", "discover_pools", "add_smart_wallet", "list_smart_wallets"]),
@@ -379,9 +379,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           step,
         });
 
-        // Lock deploy_position after first attempt regardless of outcome — retrying is never right
-        // For close/swap: only lock on success so genuine failures can be retried
-        if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
+        // Lock deploy_position after actual on-chain attempt (not safety blocks).
+        // Safety blocks (pass: false) mean the pool was rejected by pre-checks —
+        // the agent should be free to try a different pool.
+        // For close/swap: only lock on success so genuine failures can be retried.
+        const wasSafetyBlock = result?.pass === false || result?.blocked === true;
+        if (NO_RETRY_TOOLS.has(functionName) && !wasSafetyBlock) firedOnce.add(functionName);
         else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
 
         return {

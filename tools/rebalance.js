@@ -4,6 +4,7 @@ import { getTrackedPosition } from "../state.js";
 import { log } from "../logger.js";
 import { config } from "../config.js";
 import { getWalletBalances } from "./wallet.js";
+import { runSafetyChecks } from "./executor.js";
 
 /**
  * Rebalance an out-of-range position in-place:
@@ -91,9 +92,11 @@ export async function rebalancePosition({ position_address, bins_below = null })
   const balanceInfo = await getWalletBalances({});
   const solBalance = balanceInfo.sol || 0;
 
-  // Gas reserve calculation
+  // Gas reserve calculation + respect maxDeployAmount cap
   const reserve = config.management.gasReserve ?? 0.2;
-  const deploySolAmount = Math.max(0, solBalance - reserve);
+  const maxDeploy = config.management.maxDeployAmount ?? Infinity;
+  const rawAmount = Math.max(0, solBalance - reserve);
+  const deploySolAmount = Math.min(rawAmount, maxDeploy);
 
   if (deploySolAmount < (config.management.minSolToOpen ?? 0.55)) {
     throw new Error(`Insufficient SOL balance to redeploy: ${solBalance.toFixed(4)} SOL (min required after reserve: ${config.management.minSolToOpen} SOL)`);
@@ -101,7 +104,8 @@ export async function rebalancePosition({ position_address, bins_below = null })
 
   log("rebalance", `Deploying ${deploySolAmount.toFixed(4)} SOL into ${poolName} with range: ${targetBins} bins below active bin`);
 
-  const deployResult = await deployPosition({
+  // ── Safety checks (same as executor.js deploy_position gate) ──
+  const deployArgs = {
     pool_address: poolAddress,
     amount_y: deploySolAmount,
     amount_x: 0,
@@ -115,7 +119,16 @@ export async function rebalancePosition({ position_address, bins_below = null })
     fee_tvl_ratio: feeTvlRatio,
     organic_score: organicScore,
     initial_value_usd: deploySolAmount * (balanceInfo.solPriceUsd || 150),
-  });
+  };
+
+  log("rebalance", "Running safety checks before redeploy...");
+  const safetyCheck = await runSafetyChecks("deploy_position", deployArgs);
+  if (!safetyCheck.pass) {
+    log("safety_block", `Rebalance blocked by safety check: ${safetyCheck.reason}`);
+    throw new Error(`Rebalance safety check failed: ${safetyCheck.reason}`);
+  }
+
+  const deployResult = await deployPosition(deployArgs);
 
   if (!deployResult.success) {
     throw new Error(`Redeploy failed: ${deployResult.error || "unknown error"}`);

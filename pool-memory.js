@@ -176,6 +176,42 @@ export function recordPoolDeploy(poolAddress, deployData) {
     log("pool-memory", `Cooldown set for ${entry.name} until ${cooldownUntil} (low yield close)`);
   }
 
+  // Set cooldown for stop loss closes — pool/token burned us, block for 24h
+  const closeReasonLower = String(deploy.close_reason || "").toLowerCase();
+  if (closeReasonLower.includes("stop loss")) {
+    const cooldownHours = 24;
+    const poolCooldownUntil = setPoolCooldown(entry, cooldownHours, "stop loss");
+    const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, cooldownHours, "stop loss");
+    log("pool-memory", `Cooldown set for ${entry.name} until ${poolCooldownUntil} (stop loss)`);
+    if (entry.base_mint && mintCooldownUntil) {
+      log("pool-memory", `Base mint cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (stop loss)`);
+    }
+  }
+
+  // Set cooldown for big losses (>5% PnL) — token dumped hard, block for 24h
+  if (deploy.pnl_pct != null && deploy.pnl_pct <= -5) {
+    const cooldownHours = 24;
+    const reason = `big loss (${deploy.pnl_pct}%)`;
+    const poolCooldownUntil = setPoolCooldown(entry, cooldownHours, reason);
+    const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, cooldownHours, reason);
+    log("pool-memory", `Cooldown set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
+    if (entry.base_mint && mintCooldownUntil) {
+      log("pool-memory", `Base mint cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
+    }
+  }
+
+  // Set cooldown for agent decision closes with negative PnL — LLM cut the position, don't retry soon
+  if (closeReasonLower.includes("agent decision") && deploy.pnl_pct != null && deploy.pnl_pct < 0) {
+    const cooldownHours = 12;
+    const reason = `agent decision loss (${deploy.pnl_pct}%)`;
+    const poolCooldownUntil = setPoolCooldown(entry, cooldownHours, reason);
+    const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, cooldownHours, reason);
+    log("pool-memory", `Cooldown set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
+    if (entry.base_mint && mintCooldownUntil) {
+      log("pool-memory", `Base mint cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
+    }
+  }
+
   const oorTriggerCount = config.management.oorCooldownTriggerCount ?? 3;
   const oorCooldownHours = config.management.oorCooldownHours ?? 12;
   const recentDeploys = entry.deploys.slice(-oorTriggerCount);
@@ -344,7 +380,7 @@ export function recallForPool(poolAddress) {
 
   // Deploy history summary
   if (entry.total_deploys > 0) {
-    lines.push(`POOL MEMORY [${entry.name}]: ${entry.total_deploys} past deploy(s), avg PnL ${entry.avg_pnl_pct}%, win rate ${entry.win_rate}%, last outcome: ${entry.last_outcome}`);
+    lines.push(`POOL MEMORY [${entry.name}]: ${entry.total_deploys} past deploy(s), avg PnL ${entry.avg_pnl_pct}%, win rate ${Math.round(entry.win_rate * 100)}%, last outcome: ${entry.last_outcome}`);
   }
 
   if (entry.cooldown_until && new Date(entry.cooldown_until) > new Date()) {

@@ -231,8 +231,8 @@ export async function confirmIndicatorPreset({
   intervals = config.indicators.intervals,
   refresh = false,
 } = {}) {
-  if (!config.indicators.enabled || !mint || !preset) {
-    return { enabled: false, confirmed: true, reason: "Indicators disabled or not configured", intervals: [] };
+  if (!config.indicators.enabled || !mint || !preset || preset === "none") {
+    return { enabled: false, confirmed: false, skipped: true, reason: "Indicators disabled or not configured", intervals: [] };
   }
 
   const targets = normalizeIntervals(intervals);
